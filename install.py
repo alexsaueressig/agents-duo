@@ -6,8 +6,9 @@
     python install.py --codex      # Codex only
     python install.py --dest DIR   # any other skills directory
 
-Shared files (agents_bus.py, protocol.md) live in skills/agents-duo-orchestrator and are
-synced into skills/agents-duo-assistant first, so each installed skill is self-contained.
+Shared files (agents_bus.py, protocol.md) live in skills/duo-orchestrator and are
+synced into skills/duo-assistant and skills/duo-start first, so each installed skill
+is self-contained.
 """
 import argparse
 import shutil
@@ -15,16 +16,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SKILLS = ROOT / "skills"
-NAMES = ("agents-duo-orchestrator", "agents-duo-assistant")
+NAMES = ("duo-orchestrator", "duo-assistant", "duo-start")
 SHARED = ("scripts/agents_bus.py", "references/protocol.md")
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "*.tmp")
 
 
 def sync_shared():
-    src, dst = SKILLS / "agents-duo-orchestrator", SKILLS / "agents-duo-assistant"
-    for rel in SHARED:
-        (dst / rel).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src / rel, dst / rel)
+    src = SKILLS / "duo-orchestrator"
+    for name in NAMES[1:]:
+        dst = SKILLS / name
+        for rel in SHARED:
+            (dst / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src / rel, dst / rel)
 
 
 def install(target: Path):
