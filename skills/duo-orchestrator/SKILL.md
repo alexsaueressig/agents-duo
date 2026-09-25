@@ -1,6 +1,6 @@
 ---
 name: duo-orchestrator
-description: Act as the ORCHESTRATOR of a multi-agent team where Claude Code, Codex, GPT or any AI coding agents work together on the same project through shared Markdown files (.agents-chat/*.md and .agents-transfer-data/*.md). Plans the work, splits it into tasks, delegates to one or more named assistants weighing each one's token usage, reviews results, so tokens and processing are spread across platforms. Use it whenever the user types /duo-orchestrator or $duo-orchestrator, asks you to "orchestrate", "lead", "coordinate" or "delegate to Codex/Claude/the other agents", wants several agents or platforms working together, wants to split token usage, or mentions .agents-chat or .agents-transfer-data, even if they don't name this skill.
+description: Act as the ORCHESTRATOR of a multi-agent team where Claude Code, Codex, GPT or any AI coding agents work together on the same project through shared Markdown files in .agents-duo/. Plans the work, splits it into tasks, delegates to one or more named assistants weighing each one's token usage, reviews results, so tokens and processing are spread across platforms. Use it whenever the user types /duo-orchestrator or $duo-orchestrator, asks you to "orchestrate", "lead", "coordinate" or "delegate to Codex/Claude/the other agents", wants several agents or platforms working together, wants to split token usage, or mentions .agents-duo, even if they don't name this skill.
 ---
 
 # Be the orchestrator
@@ -9,7 +9,7 @@ You lead a team of one or more **assistants**, each identified by a name (e.g. `
 
 ## The bus
 
-All communication goes through `scripts/agents_bus.py`, next to this SKILL.md. Run it from the **project root**. Below, `BUS` means `python "<that path>"`. Never edit `.agents-chat/` or `.agents-transfer-data/` by hand. `references/protocol.md` has the format.
+All communication goes through `scripts/agents_bus.py`, next to this SKILL.md. Run it from the **project root**. Below, `BUS` means `python "<that path>"`. Never edit `.agents-duo/` by hand. `references/protocol.md` has the format.
 
 `wait` blocks up to 60s. If your shell tool has a timeout, set it to at least 75000 ms. Run it in the foreground.
 
@@ -17,6 +17,7 @@ All communication goes through `scripts/agents_bus.py`, next to this SKILL.md. R
 
 1. `BUS init --role orchestrator --agent "<Claude Code|Codex|...>"` (add `--feedback-interval N` if the user wants another rhythm than 30s; `--takeover` only if the user confirms an old orchestrator is dead).
 2. Tell the user in one line that you're online. Assistants join with `/duo-assistant` or `$duo-assistant` on their platforms. Any number can join, each under its own name.
+   - **Agent that can only read and edit files** (a chat agent without shell or Python): run `BUS invite <name>`, then give the user the one line it prints for that agent. Its tasks and replies go through `.agents-duo/<name>/inbox.md` and `outbox.md`, and appear in your `wait` like any other message. It can't report token usage, it doesn't loop on its own (the user nudges it), and its replies show up about 2s after it stops editing.
 3. `BUS wait --role orchestrator` until the assistants' pings arrive. Pings are answered automatically. Ask the user for the goal if you don't have one.
 
 ## Choosing who does what

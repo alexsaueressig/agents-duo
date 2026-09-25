@@ -53,7 +53,7 @@ class BusTest(unittest.TestCase):
                                   stdout=subprocess.PIPE, text=True) for n in "abcd" for i in range(3)]
         for p in procs:
             p.communicate()
-        names = [p.name for p in (self.root / ".agents-transfer-data").iterdir()]
+        names = [p.name for p in (self.root / ".agents-duo/messages").iterdir()]
         ids = [n[:4] for n in names]
         self.assertEqual(len(ids), len(set(ids)), names)
         self.assertEqual(len(ids), 5 + 12)
@@ -78,7 +78,7 @@ class BusTest(unittest.TestCase):
             self.assertIn(f"--type result --reply-to {tid}", out)
             asst(self.root, "codex", "send", "--type", "result", "--reply-to", str(tid), "--title", "ok", "--body", "d")
             self.assertIn("RESULT from codex", orch(self.root, "wait", "--timeout", "2").stdout)
-        self.assertFalse([p for p in (self.root / ".agents-transfer-data").iterdir() if p.suffix == ".tmp"])
+        self.assertFalse([p for p in (self.root / ".agents-duo/messages").iterdir() if p.suffix == ".tmp"])
         self.assertIn("open tasks/questions: none", bus(self.root, "status").stdout)
         self.assertIn("NO_NEW_MESSAGES", asst(self.root, "codex", "check").stdout)
 
@@ -124,6 +124,29 @@ class BusTest(unittest.TestCase):
         self.assertIn("[usage: 40k tokens | src self-reported]", orch(self.root, "check").stdout)
         self.assertIn("usage: 40k tokens", bus(self.root, "status").stdout)
 
+    def test_plain_file_assistant(self):
+        import os
+        orch(self.root, "init")
+        self.assertIn("Read .agents-duo/copilot/inbox.md", bus(self.root, "invite", "copilot").stdout)
+        tid = orch(self.root, "send", "--type", "task", "--title", "review x", "--body", "do it").stdout.split("[")[1][:4]
+        to = (self.root / ".agents-duo/copilot/inbox.md").read_text(encoding="utf-8")
+        self.assertIn(f"## [{tid}] task: review x", to)
+        self.assertIn("do it", to)
+        frm = self.root / ".agents-duo/copilot/outbox.md"
+        frm.write_text(f"## hello\n\n## reply {tid}\nreviewed, all good\n", encoding="utf-8")
+        self.assertNotIn("RESULT", orch(self.root, "check").stdout)  # too fresh: may still be mid-edit
+        old = time.time() - 5
+        os.utime(frm, (old, old))
+        out = orch(self.root, "check").stdout
+        self.assertIn(f"RESULT from copilot (plain file) (re:{tid}): reviewed, all good", out)
+        self.assertNotIn("AUTO_PONG", out)
+        self.assertNotIn("RESULT", orch(self.root, "check").stdout)  # not delivered twice
+        status = bus(self.root, "status").stdout
+        self.assertIn("copilot (assistant, plain files)", status)
+        self.assertIn("open tasks/questions: none", status)
+        orch(self.root, "send", "--type", "bye", "--title", "end", "--body", "thanks")
+        self.assertIn("Session ended", (self.root / ".agents-duo/copilot/inbox.md").read_text(encoding="utf-8"))
+
     def test_pulse_throttles_status(self):
         orch(self.root, "init")
         asst(self.root, "a", "init")
@@ -154,20 +177,20 @@ class BusTest(unittest.TestCase):
         asst(self.root, "a", "init")
         orch(self.root, "send", "--type", "task", "--title", "t", "--body", "x")
         self.assertIn("OK reset: removed 3 messages", bus(self.root, "reset", "--force").stdout)
-        chat = self.root / ".agents-chat"
-        self.assertEqual([p.name for p in chat.iterdir()], ["session.md"])
+        chat = self.root / ".agents-duo"
+        self.assertEqual(sorted(p.name for p in chat.iterdir()), ["messages", "session.md"])
         self.assertIn("created_by: duo-start", (chat / "session.md").read_text(encoding="utf-8"))
-        self.assertEqual(list((self.root / ".agents-transfer-data").iterdir()), [])
+        self.assertEqual(list((self.root / ".agents-duo/messages").iterdir()), [])
         self.assertIn("session=joined", orch(self.root, "init").stdout)
 
     def test_reset_guard_when_active(self):
         asst(self.root, "a", "init")
         self.assertEqual(bus(self.root, "reset", check=False).returncode, 3)
-        self.assertTrue(list((self.root / ".agents-transfer-data").iterdir()))
+        self.assertTrue(list((self.root / ".agents-duo/messages").iterdir()))
 
     def test_reset_without_session(self):
         self.assertIn("removed 0 messages", bus(self.root, "reset").stdout)
-        self.assertTrue((self.root / ".agents-chat" / "session.md").exists())
+        self.assertTrue((self.root / ".agents-duo/session.md").exists())
 
     def test_wait_is_capped(self):
         asst(self.root, "a", "init")

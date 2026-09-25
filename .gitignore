@@ -1,5 +1,4 @@
 __pycache__/
 *.pyc
 *.tmp
-.agents-chat/
-.agents-transfer-data/
+.agents-duo/

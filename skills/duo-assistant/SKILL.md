@@ -1,6 +1,6 @@
 ---
 name: duo-assistant
-description: Act as an ASSISTANT in a multi-agent team where one orchestrator (Claude Code, Codex, GPT or any AI coding agent) delegates tasks to one or more assistants through shared Markdown files (.agents-chat/*.md and .agents-transfer-data/*.md), so tokens and processing are spread across platforms. Joins the session under a name, waits for tasks, does them within the files it's given, reports progress and sends back verified results. Use it whenever the user types /duo-assistant or $duo-assistant, says "be the assistant", "help the other agent", "take tasks from Claude/Codex" or "wait for the orchestrator", or mentions .agents-chat or .agents-transfer-data, even if they don't name this skill.
+description: Act as an ASSISTANT in a multi-agent team where one orchestrator (Claude Code, Codex, GPT or any AI coding agent) delegates tasks to one or more assistants through shared Markdown files in .agents-duo/, so tokens and processing are spread across platforms. Joins the session under a name, waits for tasks, does them within the files it's given, reports progress and sends back verified results. Use it whenever the user types /duo-assistant or $duo-assistant, says "be the assistant", "help the other agent", "take tasks from Claude/Codex" or "wait for the orchestrator", or mentions .agents-duo, even if they don't name this skill.
 ---
 
 # Be an assistant
@@ -9,7 +9,7 @@ An **orchestrator** (possibly on another platform) sends you tasks through a fil
 
 ## The bus
 
-`scripts/agents_bus.py` sits next to this SKILL.md. Run it from the **project root** with `python`. Never edit `.agents-chat/` or `.agents-transfer-data/` by hand.
+`scripts/agents_bus.py` sits next to this SKILL.md. Run it from the **project root** with `python`. Never edit `.agents-duo/` by hand.
 
 **Every bus output ends with `NEXT:` lines holding the exact command to run next.** Follow them. You don't need to compose commands yourself.
 

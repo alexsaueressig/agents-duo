@@ -11,7 +11,9 @@ synced into skills/duo-assistant and skills/duo-start first, so each installed s
 is self-contained.
 """
 import argparse
+import os
 import shutil
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -23,21 +25,38 @@ IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "*.tmp")
 
 def sync_shared():
     src = SKILLS / "duo-orchestrator"
+    missing = [rel for rel in SHARED if not (src / rel).is_file()]
+    if missing:
+        sys.exit(f"ERROR: missing shared files in {src}: {', '.join(missing)}")
     for name in NAMES[1:]:
         dst = SKILLS / name
         for rel in SHARED:
             (dst / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src / rel, dst / rel)
+            tmp = (dst / rel).with_name((dst / rel).name + ".tmp")
+            shutil.copy2(src / rel, tmp)
+            os.replace(tmp, dst / rel)  # atomic per file: never a half-written copy
 
 
 def install(target: Path):
     target.mkdir(parents=True, exist_ok=True)
     for name in NAMES:
-        dst = target / name
+        dst, new, old = target / name, target / f"{name}.new", target / f"{name}.old"
+        for p in (new, old):
+            if p.exists():
+                shutil.rmtree(p)
+        shutil.copytree(SKILLS / name, new, ignore=IGNORE)  # copy fully first; the old install stays intact
         if dst.exists():
-            shutil.rmtree(dst)
-        shutil.copytree(SKILLS / name, dst, ignore=IGNORE)
+            dst.rename(old)
+        new.rename(dst)
+        if old.exists():
+            shutil.rmtree(old)
         print(f"installed {name} -> {dst}")
+
+
+def check_target(target: Path):
+    t = target.resolve()
+    if t == SKILLS or SKILLS in t.parents:
+        sys.exit(f"ERROR: {target} is inside this repo's skills/ folder; installing there would overwrite the sources.")
 
 
 def main():
@@ -53,6 +72,8 @@ def main():
     if a.codex or not (a.claude or a.dest):
         targets.append(Path.home() / ".codex" / "skills")
 
+    for t in targets:
+        check_target(t)
     sync_shared()
     for t in targets:
         install(t)

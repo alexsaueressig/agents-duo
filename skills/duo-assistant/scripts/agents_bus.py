@@ -3,17 +3,23 @@
 
 Single-writer design: every file has exactly one writer, so no locks are needed.
 
-  .agents-chat/session.md             created once (exclusive create) by whoever starts first
-  .agents-chat/<name>.md              append-only chat index, written ONLY by <name>
-                                      ("orchestrator", or an assistant name such as "codex")
-  .agents-chat/.<name>.cursor         last message id <name> has read, per source (+ heartbeat mtime)
-  .agents-chat/.ids/NNNN              id claims (exclusive create, one file per id, never rewritten)
-  .agents-transfer-data/NNNN-<name>-<type>-<slug>.md   immutable message bodies (atomic rename)
+  .agents-duo/session.md                 created once (exclusive create) by whoever starts first
+  .agents-duo/messages/NNNN-<from>-<type>-<slug>.md   immutable message bodies (atomic rename)
+  .agents-duo/.ids/NNNN                  id claims (exclusive create, one file per id, never rewritten)
+  .agents-duo/<name>/                    one folder per participant ("orchestrator", "codex", ...):
+      index.md       append-only chat index, written ONLY by <name>
+      cursor         index lines <name> has read, per source (+ heartbeat mtime)
+      usage.json     cache for token-usage measurement
+      inbox.md       plain-file assistants only: written ONLY by the orchestrator
+      outbox.md      plain-file assistants only: written ONLY by <name>, by hand
 
 Topology is a star: the orchestrator talks to one assistant (--to NAME) or to all (--to all);
 assistants talk only to the orchestrator.
 
-Commands: init, send, wait, check, pulse, status, read, reset.  Run with -h for details.
+Agents without shell/Python join as plain-file assistants (`invite NAME`): they read
+.agents-duo/<name>/inbox.md and append '## reply NNNN' sections to .agents-duo/<name>/outbox.md.
+
+Commands: init, send, wait, check, pulse, status, invite, read, reset.  Run with -h for details.
 Stdlib only. Works on Windows, macOS, Linux.
 """
 import argparse
@@ -34,10 +40,11 @@ TYPES = ("ping", "pong", "task", "result", "question", "answer", "status", "done
 BROADCAST_TYPES = ("ping", "status", "bye")  # orchestrator sends these to all by default
 MAX_WAIT = 60            # hard cap for a single blocking wait, seconds
 DEFAULT_INTERVAL = 30    # default feedback interval, seconds
-CHAT_DIR = ".agents-chat"
-DATA_DIR = ".agents-transfer-data"
+BASE_DIR = ".agents-duo"      # everything the bus writes lives under this one folder
+MSG_DIR = "messages"          # message bodies, inside BASE_DIR
+MSG_FROM_AGENT = f"../{MSG_DIR}"  # body path as written in index lines (relative to an agent folder)
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
-RESERVED = (ORCH, ALL, "session")
+RESERVED = (ORCH, ALL, "session", MSG_DIR)
 LINE_RE = re.compile(
     r"^- \[(?P<id>\d+)\] (?P<ts>\S+) (?P<type>\w+)(?: re:(?P<re>\d+))? -> (?P<to>[\w-]+): (?P<title>.*) \| (?P<path>\S+)$"
 )
@@ -56,15 +63,19 @@ def now_iso():
 
 def paths(root):
     root = Path(root).resolve()
-    return root, root / CHAT_DIR, root / DATA_DIR
+    return root, root / BASE_DIR, root / BASE_DIR / MSG_DIR
+
+
+def agent_dir(chat, name):
+    return chat / name
 
 
 def index_file(chat, name):
-    return chat / f"{name}.md"
+    return chat / name / "index.md"
 
 
 def cursor_file(chat, name):
-    return chat / f".{name}.cursor"
+    return chat / name / "cursor"
 
 
 def slugify(text, n=40):
@@ -78,17 +89,124 @@ def identity(a):
         if a.name and a.name != ORCH:
             sys.exit("ERROR: the orchestrator is always named 'orchestrator'; drop --name.")
         return ORCH
-    name = (a.name or "assistant").lower()
+    return valid_name(a.name or "assistant")
+
+
+def valid_name(name):
+    name = name.lower()
     if not NAME_RE.match(name) or name in RESERVED:
         sys.exit(f"ERROR: invalid assistant name {name!r} (use a-z, 0-9, '-'; not {', '.join(RESERVED)}).")
     return name
 
 
 def assistants(chat):
-    """Names of every assistant that has joined (has an index file)."""
+    """Names of every assistant: bus assistants (own index) and plain-file assistants (invited)."""
     if not chat.is_dir():
         return []
-    return sorted(p.stem for p in chat.glob("*.md") if p.stem not in RESERVED)
+    return sorted(d.name for d in chat.iterdir()
+                  if d.is_dir() and d.name not in RESERVED and not d.name.startswith(".")
+                  and ((d / "index.md").exists() or (d / "inbox.md").exists()))
+
+
+def is_plain(chat, name):
+    return inbox_file(chat, name).exists() and not index_file(chat, name).exists()
+
+
+# ---------------------------------------------------------------- plain-file assistants
+# The fundamental channel for agents that can only read and edit files (no shell/Python):
+#   .agents-duo/<name>/inbox.md   written only by the orchestrator: rules + every message for <name>, in full
+#   .agents-duo/<name>/outbox.md  written only by <name>, by hand: "## reply 0005" sections
+
+PLAIN_SETTLE = 2.0  # seconds an outbox must be unchanged before it is read (the agent may be mid-edit)
+PLAIN_SEC = re.compile(r"^##[ \t]*(hello|reply|result|question|status|bye)\b[ \t]*\[?#?(\d+)?\]?[^\n]*$", re.I | re.M)
+PLAIN_TYPES = {"hello": "ping", "reply": "result", "result": "result", "question": "question",
+               "status": "status", "bye": "bye"}
+
+
+def inbox_file(chat, name):
+    return chat / name / "inbox.md"
+
+
+def plain_file(chat, name):
+    return chat / name / "outbox.md"
+
+
+def parse_plain(chat, name):
+    f = plain_file(chat, name)
+    try:
+        mtime = f.stat().st_mtime
+    except FileNotFoundError:
+        return []
+    if time.time() - mtime < PLAIN_SETTLE:
+        return []  # still being edited; read on a later poll (cursors do not move)
+    text = f.read_text(encoding="utf-8", errors="replace")
+    ts = dt.datetime.fromtimestamp(mtime, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    heads = list(PLAIN_SEC.finditer(text))
+    out = []
+    for i, m in enumerate(heads):
+        body = text[m.end(): heads[i + 1].start() if i + 1 < len(heads) else len(text)].strip()
+        mtype = PLAIN_TYPES[m.group(1).lower()]
+        title = next((ln.strip() for ln in body.splitlines() if ln.strip()), mtype)[:80]
+        out.append({"id": 0, "ts": ts, "type": mtype, "re": int(m.group(2)) if m.group(2) else None,
+                    "to": ORCH, "title": title, "path": "", "from": name, "body": body, "plain": True})
+    return out
+
+
+def plain_header(name):
+    return (
+        f"# Messages for {name}\n\n"
+        f"Written only by the orchestrator. Do not edit this file.\n\n"
+        f"You are **{name}**, an assistant in a team led by an orchestrator agent. How to work:\n\n"
+        f"1. First, create `{BASE_DIR}/{name}/outbox.md` with one line: `## hello`. That file is yours: "
+        f"only you write it, and you only ever add to its end. Never edit anything else in `{BASE_DIR}/`.\n"
+        f"2. New messages are added at the bottom of this file as `## [0005] task: <title>`.\n"
+        f"3. Do each task. Edit only the files the task says you own.\n"
+        f"4. When done, add to the end of `{BASE_DIR}/{name}/outbox.md`:\n\n"
+        f"   ```\n   ## reply 0005\n   <what you did, which files changed, how you checked it>\n   ```\n\n"
+        f"   If the task is unclear, add `## question 0005` with your question instead, and wait for the answer "
+        f"here.\n"
+        f"5. Then read this file again for the next message. If there is none yet, tell the user you are waiting "
+        f"and ask them to say \"check\" later.\n"
+        f"6. When a message says `bye`, stop. If you have to stop early, add `## bye` with the state of your work.\n\n"
+        f"---\n"
+    )
+
+
+def render_plain(chat, to, mid, mtype, title, body, reply_to):
+    """Append an orchestrator message, in full, to each plain recipient's inbox (single writer)."""
+    if mtype in ("ping", "pong"):
+        return
+    names = [n for n in assistants(chat) if is_plain(chat, n)] if to == ALL else [to] if is_plain(chat, to) else []
+    re_part = f" (re {int(reply_to):04d})" if reply_to else ""
+    hint = {"task": f"\n\n→ When done, add `## reply {mid:04d}` to your outbox.md.",
+            "bye": "\n\n→ Session ended. Stop now."}.get(mtype, "")
+    for n in names:
+        append_text(inbox_file(chat, n), f"\n## [{mid:04d}] {mtype}{re_part}: {title}\n\n{(body or '').strip()}{hint}\n")
+
+
+def append_text(path, text, stale=5.0):
+    """Append for a file's single owner. The owner may run several processes at once (parallel tool
+    calls), and appends are not atomic across processes on Windows, so a short exclusive-create lock
+    guards the write. A lock older than `stale` seconds is from a crashed process and is removed."""
+    lock = path.with_name(path.name + ".lock")
+    while True:
+        try:
+            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > stale:
+                    lock.unlink()
+            except FileNotFoundError:
+                pass
+            time.sleep(0.01)
+    try:
+        with open(path, "a", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+    finally:
+        lock.unlink()
 
 
 def participants(chat):
@@ -108,7 +226,7 @@ def parse_index(chat, name):
     """Return complete entries of <name>'s index (ignores a trailing partial line)."""
     f = index_file(chat, name)
     if not f.exists():
-        return []
+        return parse_plain(chat, name) if is_plain(chat, name) else []
     raw = f.read_text(encoding="utf-8", errors="replace")
     if not raw.endswith("\n"):
         raw = raw[: raw.rfind("\n") + 1]  # last line still being written
@@ -125,7 +243,7 @@ def parse_index(chat, name):
 
 
 def read_cursors(chat, name):
-    """{source: last id read}. Each source's index is append-only in id order."""
+    """{source: number of that source's index lines already read}."""
     out = {}
     try:
         for line in cursor_file(chat, name).read_text(encoding="utf-8").splitlines():
@@ -139,6 +257,7 @@ def read_cursors(chat, name):
 
 def write_cursors(chat, name, cursors):
     f = cursor_file(chat, name)
+    f.parent.mkdir(exist_ok=True)
     tmp = f.with_suffix(".tmp")
     tmp.write_text("".join(f"{k} {v}\n" for k, v in sorted(cursors.items())), encoding="utf-8")
     os.replace(tmp, f)
@@ -154,7 +273,8 @@ def heartbeat(chat, name):
 
 def last_seen(chat, name):
     """Seconds since <name> last touched the bus, or None if never."""
-    stamps = [p.stat().st_mtime for p in (cursor_file(chat, name), index_file(chat, name)) if p.exists()]
+    stamps = [p.stat().st_mtime for p in (cursor_file(chat, name), index_file(chat, name), plain_file(chat, name))
+              if p.exists()]
     return None if not stamps else max(0, time.time() - max(stamps))
 
 
@@ -178,10 +298,12 @@ def front_matter(text):
 
 
 def body_path(chat, entry):
-    return (chat / entry["path"]).resolve()
+    return (chat / entry["from"] / entry["path"]).resolve()
 
 
 def entry_fm(chat, entry):
+    if entry.get("plain"):
+        return {}
     try:
         return front_matter(body_path(chat, entry).read_text(encoding="utf-8", errors="replace"))
     except FileNotFoundError:
@@ -216,7 +338,7 @@ def agent_label(chat, name):
 
 def require_session(chat):
     if not chat.exists():
-        sys.exit(f"ERROR: no {CHAT_DIR}/ here. Run `init --role <role>` first (cwd={Path.cwd()}).")
+        sys.exit(f"ERROR: no {BASE_DIR}/ here. Run `init --role <role>` first (cwd={Path.cwd()}).")
 
 
 def claim_id(chat):
@@ -367,7 +489,7 @@ def measure_usage(root, chat, me, agent):
     a = (agent or "").lower()
     try:
         if "claude" in a:
-            return claude_usage(root, chat / f".{me}.usage")
+            return claude_usage(root, chat / me / "usage.json")
         if "codex" in a:
             return codex_usage(root)
     except Exception:  # never let measurement break messaging
@@ -418,13 +540,18 @@ def do_send(root, me, mtype, title, body, to, reply_to=None, extra=None):
         os.fsync(fh.fileno())
     os.replace(tmp, data / name)  # atomic: readers never see a partial body
     re_part = f" re:{int(reply_to):04d}" if reply_to else ""
-    line = f"- [{mid:04d}] {fm['created']} {mtype}{re_part} -> {to}: {title} | ../{DATA_DIR}/{name}\n"
-    with open(index_file(chat, me), "a", encoding="utf-8", newline="\n") as fh:  # single writer
-        fh.write(line)
-        fh.flush()
-        os.fsync(fh.fileno())
+    line = f"- [{mid:04d}] {fm['created']} {mtype}{re_part} -> {to}: {title} | {MSG_FROM_AGENT}/{name}\n"
+    agent_dir(chat, me).mkdir(exist_ok=True)
+    append_text(index_file(chat, me), line)  # single writer (possibly several of its processes)
+    if me == ORCH:
+        render_plain(chat, to, mid, mtype, title, body, reply_to)
     heartbeat(chat, me)
     return mid
+
+
+def unread(chat, me, src, cursors):
+    """Cursors count complete index lines read (not ids: concurrent sends can append ids out of order)."""
+    return parse_index(chat, src)[cursors.get(src, 0):]
 
 
 def fetch_new(chat, me):
@@ -432,9 +559,9 @@ def fetch_new(chat, me):
     cursors = read_cursors(chat, me)
     msgs = []
     for src in sources(chat, me):
-        entries = [e for e in parse_index(chat, src) if e["id"] > cursors.get(src, 0)]
+        entries = unread(chat, me, src, cursors)
         if entries:
-            cursors[src] = entries[-1]["id"]
+            cursors[src] = cursors.get(src, 0) + len(entries)
             msgs += [e for e in entries if addressed_to(e, me)]
     return sorted(msgs, key=lambda e: e["id"]), cursors
 
@@ -443,13 +570,18 @@ def print_messages(chat, me, msgs, max_chars):
     for e in msgs:
         re_part = f" (re:{e['re']:04d})" if e["re"] else ""
         to_part = " [to all]" if e["to"] == ALL else ""
-        print(f"=== [{e['id']:04d}] {e['type'].upper()} from {e['from']}{to_part}{re_part}: {e['title']} ===")
-        p = body_path(chat, e)
-        try:
-            text = p.read_text(encoding="utf-8", errors="replace")
-        except FileNotFoundError:
-            print(f"(body missing: {p})")
-            continue
+        id_part = f"[{e['id']:04d}] " if e["id"] else ""
+        plain = " (plain file)" if e.get("plain") else ""
+        print(f"=== {id_part}{e['type'].upper()} from {e['from']}{plain}{to_part}{re_part}: {e['title']} ===")
+        if e.get("plain"):
+            text = e["body"]
+        else:
+            p = body_path(chat, e)
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except FileNotFoundError:
+                print(f"(body missing: {p})")
+                continue
         end = text.find("\n---", 3) if text.startswith("---") else -1
         fm = front_matter(text)
         body = text[end + 4:].strip() if end != -1 else text.strip()
@@ -479,8 +611,9 @@ def silence_note(chat, me):
     parts, warns = [], []
     for n in act:
         age = last_seen(chat, n)
-        parts.append(f"{n} {fmt_age(age)}")
-        if age is not None and age > 3 * feedback_interval(chat, n):
+        plain = is_plain(chat, n)
+        parts.append(f"{n}{' (plain)' if plain else ''} {fmt_age(age)}")
+        if not plain and age is not None and age > 3 * feedback_interval(chat, n):
             warns.append(f"{n} silent for {int(age)}s")
     note = "assistants last seen: " + ", ".join(parts)
     if warns:
@@ -498,7 +631,6 @@ def next_hints(root_arg, me, msgs):
     """NEXT: lines for assistants. The orchestrator gets none (it follows its skill)."""
     if me == ORCH:
         return []
-    wait = bus_cmd(root_arg, me, "wait")
     out = []
     for e in msgs:
         if e["type"] == "bye":
@@ -511,13 +643,13 @@ def next_hints(root_arg, me, msgs):
                        f"--title \"<one-line outcome>\" --body \"<changed files, how you verified, open questions>\"")
             out.append(f"NEXT: if the task is unclear, ask first: {bus_cmd(root_arg, me, 'send')} --type question "
                        f"--reply-to {e['id']} --title \"<question>\" --body \"<details>\"")
-    return out + [f"NEXT: then wait again: {wait}"]
+    return out + [f"NEXT: then wait again: {bus_cmd(root_arg, me, 'wait')}"]
 
 
 def auto_pong(root_arg, chat, me, msgs):
     """Every ping gets a pong; the script does it so agents never have to."""
     for e in msgs:
-        if e["type"] == "ping":
+        if e["type"] == "ping" and not e.get("plain"):
             mid = do_send(root_arg, me, "pong", "pong", "auto-reply", e["from"] if me == ORCH else ORCH, e["id"])
             print(f"AUTO_PONG [{mid:04d}] -> {e['from']}")
 
@@ -559,8 +691,8 @@ def create_session(root, chat, created_by):
                 f"- project: {root}\n- default_feedback_interval: {DEFAULT_INTERVAL}s "
                 "(the orchestrator's latest ping/status overrides this)\n\n"
                 "Rules: one orchestrator, any number of named assistants. Each participant appends ONLY\n"
-                "to its own index (`orchestrator.md`, `<assistant-name>.md`).\n"
-                f"Message bodies live in `../{DATA_DIR}/` and are never edited after creation.\n"
+                "to its own folder (`orchestrator/`, `<assistant-name>/`).\n"
+                f"Message bodies live in `{MSG_DIR}/` and are never edited after creation.\n"
                 "Use the agents_bus.py script to send/receive; do not hand-edit these files.\n"
             )
         return True
@@ -572,10 +704,9 @@ def ensure_gitignore(root):
     gi = root / ".gitignore"
     if gi.exists():
         lines = gi.read_text(encoding="utf-8", errors="replace").splitlines()
-        missing = [d + "/" for d in (CHAT_DIR, DATA_DIR) if d + "/" not in lines and d not in lines]
-        if missing:
+        if BASE_DIR + "/" not in lines and BASE_DIR not in lines:
             with open(gi, "a", encoding="utf-8") as fh:
-                fh.write(("\n" if lines and lines[-1].strip() else "") + "\n".join(missing) + "\n")
+                fh.write(("\n" if lines and lines[-1].strip() else "") + BASE_DIR + "/\n")
 
 
 def cmd_init(a):
@@ -590,6 +721,7 @@ def cmd_init(a):
               f"If that session is dead, re-run with --takeover.{hint}")
         sys.exit(3)
     created = create_session(root, chat, me)
+    agent_dir(chat, me).mkdir(exist_ok=True)
     idx = index_file(chat, me)
     if not idx.exists():
         header = f"# {ORCH} -> assistants" if me == ORCH else f"# {me} -> {ORCH}"
@@ -684,22 +816,23 @@ def cmd_status(a):
         print(f"- {ORCH}: not joined")
     for n, own in idx.items():
         last = own[-1] if own else None
+        plain = n != ORCH and is_plain(chat, n)
         cursors = read_cursors(chat, n)
-        unread = sum(1 for s in sources(chat, n) for e in parse_index(chat, s)
-                     if e["id"] > cursors.get(s, 0) and addressed_to(e, n))
-        last_s = f"last=[{last['id']:04d}] {last['type']}" if last else "last=none"
+        n_unread = "n/a" if plain else sum(
+            1 for s in sources(chat, n) for e in unread(chat, n, s, cursors) if addressed_to(e, n))
+        last_s = (f"last={'[%04d] ' % last['id'] if last['id'] else ''}{last['type']}" if last else "last=none")
         agent = agent_label(chat, n)
-        role = "" if n == ORCH else " (assistant)"
+        role = "" if n == ORCH else " (assistant, plain files)" if plain else " (assistant)"
         left = ", LEFT" if n != ORCH and departed(chat, n) else ""
         print(f"- {n}{role}{f' [{agent}]' if agent else ''}: last seen {fmt_age(last_seen(chat, n))}, "
-              f"active {active_for(chat, n) or '0m'}, sent {len(own)}, {last_s}, unread: {unread}{left}")
+              f"active {active_for(chat, n) or '0m'}, sent {len(own)}, {last_s}, unread: {n_unread}{left}")
         usage, at = latest_usage(chat, n)
         print(f"    usage: {usage} (reported {at})" if usage else "    usage: not reported")
     if not assistants(chat):
         print("- assistants: none joined")
     everything = [e for own in idx.values() for e in own]
     replied = {e["re"] for e in everything if e["re"] and e["type"] in ("result", "answer", "done")}
-    open_items = [e for e in everything if e["type"] in ("task", "question") and e["id"] not in replied]
+    open_items = [e for e in everything if e["type"] in ("task", "question") and e["id"] and e["id"] not in replied]
     if open_items:
         print("open tasks/questions (no result/answer yet):")
         for e in sorted(open_items, key=lambda e: e["id"]):
@@ -709,7 +842,7 @@ def cmd_status(a):
 
 
 def cmd_reset(a):
-    """delete the chat and transfer-data folders and create a fresh, empty session."""
+    """delete the whole .agents-duo folder and create a fresh, empty session."""
     root, chat, data = paths(a.root)
     if chat.is_dir() and not a.force:
         for n in participants(chat):
@@ -719,14 +852,29 @@ def cmd_reset(a):
                       f"Stop it first or re-run with --force.")
                 sys.exit(3)
     removed = len(list(data.glob("*.md"))) if data.is_dir() else 0
-    for d in (chat, data):
-        if d.is_dir():
-            shutil.rmtree(d)
+    if chat.is_dir():
+        shutil.rmtree(chat)
     chat.mkdir(parents=True, exist_ok=True)
     data.mkdir(parents=True, exist_ok=True)
     create_session(root, chat, "duo-start")
     ensure_gitignore(root)
     print(f"OK reset: removed {removed} messages | fresh session at {chat / 'session.md'}")
+
+
+def cmd_invite(a):
+    """orchestrator: set up a plain-file assistant (no shell/Python needed on its side)."""
+    root, chat, _ = paths(a.root)
+    require_session(chat)
+    name = valid_name(a.name)
+    if index_file(chat, name).exists():
+        sys.exit(f"ERROR: {name!r} already joined through the bus; pick another name.")
+    f = inbox_file(chat, name)
+    if not f.exists():
+        f.parent.mkdir(exist_ok=True)
+        f.write_text(plain_header(name), encoding="utf-8", newline="\n")
+    d = f"{BASE_DIR}/{name}"
+    print(f"OK invited {name} (plain files: {d}/inbox.md <- orchestrator, {d}/outbox.md <- {name})")
+    print(f"TELL_USER: give {name} this one line: Read {d}/inbox.md and follow its instructions.")
 
 
 def cmd_read(a):
@@ -794,6 +942,10 @@ def main():
 
     sp = sub.add_parser("status", help="show session overview")
     sp.set_defaults(fn=cmd_status)
+
+    sp = sub.add_parser("invite", help="orchestrator: add a plain-file assistant (for agents without shell/Python)")
+    sp.add_argument("name", help="assistant name, e.g. copilot")
+    sp.set_defaults(fn=cmd_invite)
 
     sp = sub.add_parser("reset", help="delete all session data and create a fresh, empty session")
     sp.add_argument("--force", action="store_true", help="reset even if an agent looks active")
