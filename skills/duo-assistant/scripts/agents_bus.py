@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """agents_bus.py - file-based message bus for one orchestrator and any number of assistants.
 
-Single-writer design: every file has exactly one writer, so no locks are needed.
+Single-writer design: every file has exactly one writer. Parallel processes of that one writer
+are serialized by a short <file>.lock.
 
   .agents-duo/session.md                 created once (exclusive create) by whoever starts first
   .agents-duo/messages/NNNN-<from>-<type>-<slug>.md   immutable message bodies (atomic rename)
@@ -23,6 +24,7 @@ Commands: init, send, wait, check, pulse, status, invite, read, reset.  Run with
 Stdlib only. Works on Windows, macOS, Linux.
 """
 import argparse
+import contextlib
 import datetime as dt
 import json
 import os
@@ -97,6 +99,13 @@ def valid_name(name):
     if not NAME_RE.match(name) or name in RESERVED:
         sys.exit(f"ERROR: invalid assistant name {name!r} (use a-z, 0-9, '-'; not {', '.join(RESERVED)}).")
     return name
+
+
+def positive_int(value):
+    n = int(value)
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive number of seconds, got {value}")
+    return n
 
 
 def assistants(chat):
@@ -184,29 +193,47 @@ def render_plain(chat, to, mid, mtype, title, body, reply_to):
         append_text(inbox_file(chat, n), f"\n## [{mid:04d}] {mtype}{re_part}: {title}\n\n{(body or '').strip()}{hint}\n")
 
 
-def append_text(path, text, stale=5.0):
-    """Append for a file's single owner. The owner may run several processes at once (parallel tool
-    calls), and appends are not atomic across processes on Windows, so a short exclusive-create lock
-    guards the write. A lock older than `stale` seconds is from a crashed process and is removed."""
+@contextlib.contextmanager
+def locked(path, stale=5.0):
+    """Short exclusive-create lock on <path>.lock. The lock holds an owner token, so a writer that
+    stalled past `stale` never removes the lock a newer process took over. A lock older than
+    `stale` seconds is from a crashed process and is removed."""
     lock = path.with_name(path.name + ".lock")
+    token = f"{os.getpid()}-{os.urandom(4).hex()}".encode()
     while True:
         try:
-            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-            break
-        except FileExistsError:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except (FileExistsError, PermissionError):  # Windows: PermissionError while a lock is being deleted
             try:
                 if time.time() - lock.stat().st_mtime > stale:
                     lock.unlink()
-            except FileNotFoundError:
+            except (FileNotFoundError, PermissionError):
                 pass
             time.sleep(0.01)
+            continue
+        try:
+            os.write(fd, token)
+        finally:
+            os.close(fd)
+        break
     try:
+        yield
+    finally:
+        try:
+            if lock.read_bytes() == token:
+                lock.unlink()
+        except (FileNotFoundError, PermissionError):
+            pass
+
+
+def append_text(path, text):
+    """Append for a file's single owner. The owner may run several processes at once (parallel tool
+    calls), and appends are not atomic across processes on Windows, so a lock guards the write."""
+    with locked(path):
         with open(path, "a", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-    finally:
-        lock.unlink()
 
 
 def participants(chat):
@@ -258,9 +285,17 @@ def read_cursors(chat, name):
 def write_cursors(chat, name, cursors):
     f = cursor_file(chat, name)
     f.parent.mkdir(exist_ok=True)
-    tmp = f.with_suffix(".tmp")
+    tmp = f.with_name(f"{f.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")  # unique per process
     tmp.write_text("".join(f"{k} {v}\n" for k, v in sorted(cursors.items())), encoding="utf-8")
-    os.replace(tmp, f)
+    for attempt in range(50):
+        try:
+            os.replace(tmp, f)
+            return
+        except PermissionError:  # Windows: a reader (e.g. status) has the cursor file open
+            if attempt == 49:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.01)
 
 
 def heartbeat(chat, name):
@@ -318,6 +353,33 @@ def feedback_interval(chat, me=ALL):
             if fm.get("feedback_interval", "").rstrip("s").isdigit():
                 return int(fm["feedback_interval"].rstrip("s"))
     return DEFAULT_INTERVAL
+
+
+def open_items(chat):
+    """Tasks and questions nobody has answered with a result/answer/done yet, by id."""
+    everything = [e for n in participants(chat) for e in parse_index(chat, n)]
+    replied = {e["re"] for e in everything if e["re"] and e["type"] in ("result", "answer", "done")}
+    return sorted((e for e in everything if e["type"] in ("task", "question") and e["id"] and e["id"] not in replied),
+                  key=lambda e: e["id"])
+
+
+def resubscribe(root_arg, chat, me):
+    """A returning assistant starts over under the same name: its history stays (the orchestrator's cursor
+    counts its index lines), its unfinished tasks are closed as dropped so the orchestrator can resend
+    them, the unread backlog is skipped and the usage cache is cleared. Returns a short note."""
+    dropped = [e for e in open_items(chat) if e["type"] == "task" and e["to"] == me]
+    for e in dropped:
+        do_send(root_arg, me, "result", "dropped: assistant resubscribed",
+                f"Task {e['id']:04d} was not finished before '{me}' restarted. Resend it if it is still needed.",
+                ORCH, e["id"])
+    cf = cursor_file(chat, me)
+    with locked(cf):
+        cursors = read_cursors(chat, me)
+        skipped = sum(1 for s in sources(chat, me) for e in unread(chat, me, s, cursors) if addressed_to(e, me))
+        write_cursors(chat, me, {s: len(parse_index(chat, s)) for s in sources(chat, me)})
+    (chat / me / "usage.json").unlink(missing_ok=True)
+    ids = ", ".join(f"{e['id']:04d}" for e in dropped) or "none"
+    return f"resubscribed (skipped {skipped} unread, dropped tasks: {ids})"
 
 
 def departed(chat, name):
@@ -660,10 +722,13 @@ def poll(root_arg, me, timeout, interval, max_chars):
     timeout = max(0.0, min(float(timeout), MAX_WAIT))
     deadline = time.time() + timeout
     while True:
-        heartbeat(chat, me)
-        msgs, cursors = fetch_new(chat, me)
-        if cursors != read_cursors(chat, me):
-            write_cursors(chat, me, cursors)
+        cf = cursor_file(chat, me)
+        cf.parent.mkdir(exist_ok=True)
+        with locked(cf):  # parallel polls of one participant: each message is delivered once
+            heartbeat(chat, me)
+            msgs, cursors = fetch_new(chat, me)
+            if cursors != read_cursors(chat, me):
+                write_cursors(chat, me, cursors)
         if msgs:
             print_messages(chat, me, msgs, max_chars)
             auto_pong(root_arg, chat, me, msgs)
@@ -720,9 +785,18 @@ def cmd_init(a):
         print(f"WARNING: {me} looks active (last seen {int(age)}s ago). "
               f"If that session is dead, re-run with --takeover.{hint}")
         sys.exit(3)
+    cleared = ""
+    if me == ORCH and not a.keep and any(data.glob("*.md")):
+        # The orchestrator starts a fresh session, unless assistants already joined it and are still active.
+        others = active_others(chat, ORCH)
+        if others:
+            cleared = f"kept session: {', '.join(n for n, _ in others)} already active"
+        else:
+            cleared = "cleared previous session: " + clear_session(root, chat, data, ORCH)
     created = create_session(root, chat, me)
     agent_dir(chat, me).mkdir(exist_ok=True)
     idx = index_file(chat, me)
+    note = resubscribe(a.root, chat, me) if me != ORCH and idx.exists() else ""
     if not idx.exists():
         header = f"# {ORCH} -> assistants" if me == ORCH else f"# {me} -> {ORCH}"
         idx.write_text(f"{header} (append-only, written only by {me})\n\n", encoding="utf-8")
@@ -742,11 +816,13 @@ def cmd_init(a):
             sys.exit("ERROR: only the orchestrator sets feedback_interval.")
         body = (f"Assistant '{me}' online (agent: {a.agent}). Ready for tasks. "
                 f"Will follow the orchestrator's feedback_interval (default {DEFAULT_INTERVAL}s).")
+        if note:
+            body += f"\n\nFresh start: {note}. Earlier context is gone; resend anything still needed."
         extra = {"agent": a.agent, "name": me}
         to = ORCH
     mid = do_send(a.root, me, "ping", f"{me} online", body, to, extra=extra)
     print(f"OK init role={a.role} name={me} session={'created' if created else 'joined'} ping=[{mid:04d}] "
-          f"| {silence_note(chat, me)}")
+          f"{''.join(f'| {x} ' for x in (cleared, note) if x)}| {silence_note(chat, me)}")
     print(f"chat: {chat}\ndata: {data}")
     if me != ORCH:
         print(f"NEXT: wait for tasks: {bus_cmd(a.root, me, 'wait')}")
@@ -830,35 +906,48 @@ def cmd_status(a):
         print(f"    usage: {usage} (reported {at})" if usage else "    usage: not reported")
     if not assistants(chat):
         print("- assistants: none joined")
-    everything = [e for own in idx.values() for e in own]
-    replied = {e["re"] for e in everything if e["re"] and e["type"] in ("result", "answer", "done")}
-    open_items = [e for e in everything if e["type"] in ("task", "question") and e["id"] and e["id"] not in replied]
-    if open_items:
+    items = open_items(chat)
+    if items:
         print("open tasks/questions (no result/answer yet):")
-        for e in sorted(open_items, key=lambda e: e["id"]):
+        for e in items:
             print(f"  [{e['id']:04d}] {e['type']} {e['from']} -> {e['to']}: {e['title']}")
     else:
         print("open tasks/questions: none")
+
+
+def active_others(chat, me=None):
+    """[(name, seconds since last seen)] of participants other than <me> that still look active."""
+    out = []
+    for n in participants(chat):
+        age = last_seen(chat, n)
+        if n != me and age is not None and age < 3 * feedback_interval(chat, n) and not departed(chat, n):
+            out.append((n, age))
+    return out
+
+
+def clear_session(root, chat, data, created_by):
+    """Delete the whole .agents-duo folder and create a fresh, empty session. Returns a short note."""
+    removed = len(list(data.glob("*.md"))) if data.is_dir() else 0
+    dropped = ", ".join(f"{e['id']:04d}" for e in open_items(chat)) if chat.is_dir() else ""
+    if chat.is_dir():
+        shutil.rmtree(chat)
+    chat.mkdir(parents=True, exist_ok=True)
+    data.mkdir(parents=True, exist_ok=True)
+    create_session(root, chat, created_by)
+    ensure_gitignore(root)
+    return f"removed {removed} messages, dropped open tasks/questions: {dropped or 'none'}"
 
 
 def cmd_reset(a):
     """delete the whole .agents-duo folder and create a fresh, empty session."""
     root, chat, data = paths(a.root)
     if chat.is_dir() and not a.force:
-        for n in participants(chat):
-            age = last_seen(chat, n)
-            if age is not None and age < 3 * feedback_interval(chat, n) and not departed(chat, n):
-                print(f"WARNING: {n} looks active (last seen {int(age)}s ago). "
-                      f"Stop it first or re-run with --force.")
-                sys.exit(3)
-    removed = len(list(data.glob("*.md"))) if data.is_dir() else 0
-    if chat.is_dir():
-        shutil.rmtree(chat)
-    chat.mkdir(parents=True, exist_ok=True)
-    data.mkdir(parents=True, exist_ok=True)
-    create_session(root, chat, "duo-start")
-    ensure_gitignore(root)
-    print(f"OK reset: removed {removed} messages | fresh session at {chat / 'session.md'}")
+        for n, age in active_others(chat):
+            print(f"WARNING: {n} looks active (last seen {int(age)}s ago). "
+                  f"Stop it first or re-run with --force.")
+            sys.exit(3)
+    note = clear_session(root, chat, data, "reset")
+    print(f"OK reset: {note} | fresh session at {chat / 'session.md'}")
 
 
 def cmd_invite(a):
@@ -902,11 +991,13 @@ def main():
         sp.add_argument("--role", required=True, choices=ROLES)
         sp.add_argument("--name", help="assistant name, unique per session, e.g. 'codex' (default: 'assistant')")
 
-    sp = sub.add_parser("init", help="create folders/session (if missing) and send ping")
+    sp = sub.add_parser("init", help="join or create the session and send ping (orchestrator: fresh session by default)")
     role(sp)
     sp.add_argument("--agent", default="unknown", help="who you are, e.g. 'Claude Code', 'Codex' or 'GPT'")
-    sp.add_argument("--feedback-interval", type=int, help="orchestrator only: seconds (default 30)")
+    sp.add_argument("--feedback-interval", type=positive_int, help="orchestrator only: seconds (default 30)")
     sp.add_argument("--takeover", action="store_true", help="claim the name even if it looks active")
+    sp.add_argument("--keep", action="store_true", help="orchestrator only: join the existing session instead of "
+                    "clearing it (it is cleared by default when no assistant is active)")
     sp.set_defaults(fn=cmd_init)
 
     sp = sub.add_parser("send", help="send a message")
@@ -918,7 +1009,7 @@ def main():
     sp.add_argument("--reply-to", type=int)
     sp.add_argument("--body", help="body text, or '-' for stdin")
     sp.add_argument("--body-file", help="read body from this file")
-    sp.add_argument("--feedback-interval", type=int, help="orchestrator only: set feedback interval (s)")
+    sp.add_argument("--feedback-interval", type=positive_int, help="orchestrator only: set feedback interval (s)")
     sp.add_argument("--usage", help=USAGE_HELP)
     sp.set_defaults(fn=cmd_send)
 

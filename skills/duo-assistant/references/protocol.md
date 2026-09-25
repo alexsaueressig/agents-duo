@@ -19,7 +19,7 @@ Everything lives under `.agents-duo/`, with one folder per participant:
   <name>/outbox.md                 plain-file assistant: <name> only, edited by hand
 ```
 
-**Single writer:** every file has one owner, so there are no merge conflicts and no torn reads. Readers ignore a half-written last index line, and a body is in place before its index line is appended. An owner that runs several processes at once (parallel tool calls) is serialized by a short `<file>.lock`, taken with an exclusive create. A lock older than 5s is treated as stale and removed.
+**Single writer:** every file has one owner, so there are no merge conflicts and no torn reads. Readers ignore a half-written last index line, and a body is in place before its index line is appended. An owner that runs several processes at once (parallel tool calls) is serialized by a short `<file>.lock`, taken with an exclusive create. The lock holds an owner token, so a process only ever releases its own lock. A lock older than 5s is treated as stale and removed. Each participant's cursor read-and-write runs under its own lock, so parallel `check`/`pulse`/`wait` calls deliver every message once.
 
 **Topology:** a star. The orchestrator sends to one assistant (`-> codex`) or to everyone (`-> all`). Assistants send only to the orchestrator.
 
@@ -33,9 +33,11 @@ Everything lives under `.agents-duo/`, with one folder per participant:
 
 **Cursors** count index lines read per source, not ids. Concurrent sends can append ids out of order, and counting lines means nothing is skipped or delivered twice.
 
+**Resubscribe:** `init` under an assistant name whose `index.md` exists resets only that assistant's part. Its index and bodies stay (the orchestrator's cursor counts those lines), each of its open tasks gets a `result` titled `dropped: assistant resubscribed`, its cursor jumps to the end (the unread backlog is skipped), `usage.json` is deleted, and it pings the orchestrator again. The whole session is reset only by the orchestrator: its `init` clears an old session when no assistant is active (`--keep` to join it instead), and `reset` does it by hand.
+
 ## Two ways to be an assistant
 
-1. **Bus assistant** (can run Python): `init --role assistant --name <name>`, then `wait` / `pulse` / `send`. Every output ends with `NEXT:` lines holding the exact command to run next. Pings are answered automatically.
+1. **Bus assistant** (can run Python): `init --role assistant --name <name>`, then `wait` / `pulse` / `send`. The `init`, `wait`, `check` and `pulse` outputs end with `NEXT:` lines holding the exact command to run next (`send` just prints `SENT`). Pings are answered automatically.
 2. **Plain-file assistant** (can only read and edit files): the orchestrator runs `invite <name>`, and the user tells the agent: *Read `.agents-duo/<name>/inbox.md` and follow its instructions.*
    - `inbox.md` explains the rules, and every message for `<name>` (or for all) is appended there in full.
    - The agent appends sections to `outbox.md`: `## hello`, `## reply 0005`, `## question 0005`, `## status`, `## bye`, each followed by free text.

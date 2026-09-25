@@ -7,8 +7,8 @@
     python install.py --dest DIR   # any other skills directory
 
 Shared files (agents_bus.py, protocol.md) live in skills/duo-orchestrator and are
-synced into skills/duo-assistant and skills/duo-start first, so each installed skill
-is self-contained.
+synced into skills/duo-assistant first, so each installed skill is self-contained.
+duo-start is deprecated: it is still installed, as a stub that overwrites older copies.
 """
 import argparse
 import os
@@ -28,7 +28,7 @@ def sync_shared():
     missing = [rel for rel in SHARED if not (src / rel).is_file()]
     if missing:
         sys.exit(f"ERROR: missing shared files in {src}: {', '.join(missing)}")
-    for name in NAMES[1:]:
+    for name in ("duo-assistant",):
         dst = SKILLS / name
         for rel in SHARED:
             (dst / rel).parent.mkdir(parents=True, exist_ok=True)

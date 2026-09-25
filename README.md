@@ -15,7 +15,7 @@ Claude Code: /duo-orchestrator      Codex: $duo-assistant             VS Code ch
         └──────────► .agents-duo/messages/ ◄┘      .agents-duo/copilot/inbox.md (orchestrator writes)
 ```
 
-Any platform can take any role. All three skills (`duo-start`, `duo-orchestrator`, `duo-assistant`) are installed for both Claude Code and Codex.
+Any platform can take any role. Both skills (`duo-orchestrator`, `duo-assistant`) are installed for both Claude Code and Codex. `duo-start` is deprecated and only points to `/duo-orchestrator`.
 
 ## Install
 
@@ -32,8 +32,7 @@ python install.py            # installs into ~/.claude/skills and ~/.codex/skill
 
 In the same project folder:
 
-0. **Optional, to start fresh:** `/duo-start` (or `$duo-start`) deletes the previous session (`.agents-duo/`) and sets up a new, empty one.
-1. **Orchestrator**, e.g. Claude Code: `/duo-orchestrator`, then describe the goal.
+1. **Orchestrator**, e.g. Claude Code: `/duo-orchestrator`, then describe the goal. It starts a fresh session, clearing the previous `.agents-duo/` unless an assistant in it is still active.
 2. **Assistants**, e.g. Codex: `$duo-assistant`. It asks you for the assistant's name. Start as many as you like, each with its own name.
 
 Any of them can start first. Pings are answered automatically. The orchestrator sends tasks to a named assistant (or to all), and assistants send progress updates and then results. The orchestrator ends the session with `bye`, and an assistant leaves with `bye`.
@@ -50,7 +49,7 @@ Then always run the command shown on the NEXT: lines of each output, and never e
 Keep going until you see PEER_SAID_BYE.
 ```
 
-Every assistant-side output ends with `NEXT:` lines holding the exact command to run next.
+On the assistant side, `init`, `wait`, `check` and `pulse` end with `NEXT:` lines holding the exact command to run next (`send` just prints `SENT`).
 
 **Can only read and edit files:** ask the orchestrator to invite it (`invite copilot`), then tell the agent one line:
 
@@ -105,7 +104,7 @@ BUS=~/.claude/skills/duo-orchestrator/scripts/agents_bus.py
 python $BUS status            # participants, last seen, active time, usage, open tasks
 python $BUS invite copilot    # add a plain-file assistant
 python $BUS read --id 3       # print one message
-python $BUS reset             # what /duo-start runs
+python $BUS reset             # wipe the session by hand
 ```
 
 Commands: `init`, `send`, `wait`, `check`, `pulse`, `status`, `invite`, `read`, `reset`. Run with `-h` for details. The full protocol is in [`skills/duo-orchestrator/references/protocol.md`](skills/duo-orchestrator/references/protocol.md).
@@ -114,7 +113,8 @@ Commands: `init`, `send`, `wait`, `check`, `pulse`, `status`, `invite`, `read`, 
 
 - **Codex shell timeout:** Codex's default shell timeout is shorter than 60 s. The skills tell the agent to use at least 75 s for `wait`.
 - **Git:** if the project has a `.gitignore`, `init` adds `.agents-duo/` to it.
-- **Starting over:** `/duo-start` (or `python $BUS reset`) deletes `.agents-duo/` and creates a fresh session. It refuses while an agent still looks active unless you pass `--force`.
+- **Starting over:** `/duo-orchestrator` clears the old session on start when no assistant is active (`init --keep` joins it instead). `python $BUS reset` wipes it by hand and refuses while an agent still looks active unless you pass `--force`.
+- **Restarting one assistant:** run `$duo-assistant` again under the same name. It resubscribes: only its own part is reset, its unfinished tasks come back to the orchestrator as `dropped`, and the rest of the session keeps going.
 - **Same platform twice:** if two agents on the same platform work in the same project, their usage may be measured from the same (newest) session log.
 
 ## Development
@@ -123,7 +123,7 @@ Commands: `init`, `send`, `wait`, `check`, `pulse`, `status`, `invite`, `read`, 
 python -m unittest discover -s tests
 ```
 
-Edit shared files (`agents_bus.py`, `protocol.md`) in `skills/duo-orchestrator/`. `install.py` copies them into `duo-assistant` and `duo-start`, and refuses to install into the repo's own `skills/` folder.
+Edit shared files (`agents_bus.py`, `protocol.md`) in `skills/duo-orchestrator/`. `install.py` copies them into `duo-assistant`, and refuses to install into the repo's own `skills/` folder.
 
 ## License
 

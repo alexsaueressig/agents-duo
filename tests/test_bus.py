@@ -162,6 +162,78 @@ class BusTest(unittest.TestCase):
         orch(self.root, "init", "--feedback-interval", "15")
         self.assertIn("feedback_interval: 15s", bus(self.root, "status").stdout)
 
+    def test_interval_must_be_positive(self):
+        for bad in ("0", "-5"):
+            self.assertNotEqual(orch(self.root, "init", "--feedback-interval", bad, check=False).returncode, 0, bad)
+        orch(self.root, "init")
+        for bad in ("0", "-5"):
+            r = orch(self.root, "send", "--type", "status", "--title", "x", "--body", "x",
+                     "--feedback-interval", bad, check=False)
+            self.assertNotEqual(r.returncode, 0, bad)
+
+    def test_parallel_checks_deliver_each_message_once(self):
+        orch(self.root, "init")
+        asst(self.root, "a", "init")
+        titles = [f"task-{i}" for i in range(6)]
+        for t in titles:
+            orch(self.root, "send", "--type", "task", "--title", t, "--body", "x")
+        procs = [subprocess.Popen([sys.executable, str(BUS), cmd, "--role", "assistant", "--name", "a",
+                                   "--root", str(self.root)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True, encoding="utf-8") for cmd in ["check", "pulse"] * 4]
+        outs = [p.communicate() for p in procs]
+        self.assertFalse([err for _, err in outs if err.strip()], "stderr output")
+        joined = "".join(out for out, _ in outs)
+        for t in titles:
+            self.assertEqual(joined.count(f"TASK from orchestrator: {t} ==="), 1, t)
+        adir = self.root / ".agents-duo/a"
+        self.assertFalse([p.name for p in adir.iterdir() if p.suffix in (".tmp", ".lock")])
+        self.assertIn("NO_NEW_MESSAGES", asst(self.root, "a", "check").stdout)
+
+    def test_lock_recovers_stale_and_keeps_foreign_lock(self):
+        import importlib.util
+        import os
+        spec = importlib.util.spec_from_file_location("agents_bus", BUS)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        target = self.root / "f.md"
+        lock = self.root / "f.md.lock"
+        lock.write_bytes(b"dead-writer")
+        old = time.time() - 60
+        os.utime(lock, (old, old))
+        with mod.locked(target):  # stale lock from a crashed process is taken over
+            self.assertNotEqual(lock.read_bytes(), b"dead-writer")
+            lock.write_bytes(b"newer-owner")  # we stalled and someone else took the lock over
+        self.assertEqual(lock.read_bytes(), b"newer-owner")  # release leaves the other owner's lock alone
+        lock.unlink()
+        with mod.locked(target):
+            pass
+        self.assertFalse(lock.exists())
+
+    def test_assistant_resubscribes_on_init(self):
+        orch(self.root, "init")
+        asst(self.root, "a", "init")
+        asst(self.root, "a", "check")
+        orch(self.root, "check")
+        asst(self.root, "a", "check")  # consume auto-pongs
+        done_id = orch(self.root, "send", "--type", "task", "--title", "finished", "--body", "x").stdout.split("[")[1][:4]
+        asst(self.root, "a", "check")
+        asst(self.root, "a", "send", "--type", "result", "--reply-to", done_id, "--title", "ok", "--body", "x")
+        open_id = orch(self.root, "send", "--type", "task", "--title", "unfinished", "--body", "x").stdout.split("[")[1][:4]
+        orch(self.root, "send", "--type", "status", "--title", "backlog", "--body", "x")
+        (self.root / ".agents-duo/a/usage.json").write_text("{}", encoding="utf-8")
+        out = asst(self.root, "a", "init", "--takeover").stdout
+        self.assertIn(f"resubscribed (skipped 2 unread, dropped tasks: {open_id})", out)
+        self.assertFalse((self.root / ".agents-duo/a/usage.json").exists())
+        self.assertIn("NO_NEW_MESSAGES", asst(self.root, "a", "check").stdout)  # backlog skipped
+        out = orch(self.root, "check").stdout
+        self.assertIn(f"RESULT from a (re:{open_id}): dropped: assistant resubscribed", out)
+        self.assertIn("Fresh start: resubscribed", out)
+        status = bus(self.root, "status").stdout
+        self.assertIn("open tasks/questions: none", status)
+        self.assertIn("sent 5", status)  # history kept: ping, pong, result, dropped result, new ping
+        orch(self.root, "send", "--type", "task", "--title", "after", "--body", "x")
+        self.assertIn("TASK from orchestrator: after", asst(self.root, "a", "check").stdout)
+
     def test_invalid_names(self):
         for bad in ("all", "orchestrator", "Bad Name"):
             self.assertNotEqual(asst(self.root, bad, "init", check=False).returncode, 0, bad)
@@ -179,9 +251,33 @@ class BusTest(unittest.TestCase):
         self.assertIn("OK reset: removed 3 messages", bus(self.root, "reset", "--force").stdout)
         chat = self.root / ".agents-duo"
         self.assertEqual(sorted(p.name for p in chat.iterdir()), ["messages", "session.md"])
-        self.assertIn("created_by: duo-start", (chat / "session.md").read_text(encoding="utf-8"))
+        self.assertIn("created_by: reset", (chat / "session.md").read_text(encoding="utf-8"))
         self.assertEqual(list((self.root / ".agents-duo/messages").iterdir()), [])
         self.assertIn("session=joined", orch(self.root, "init").stdout)
+
+    def test_orchestrator_init_starts_fresh(self):
+        import os
+        orch(self.root, "init")
+        asst(self.root, "a", "init")
+        orch(self.root, "send", "--type", "task", "--title", "old", "--body", "x")
+        old = time.time() - 600  # both agents stopped long ago
+        for p in (self.root / ".agents-duo").rglob("*"):
+            os.utime(p, (old, old))
+        out = orch(self.root, "init", "--takeover").stdout
+        self.assertIn("cleared previous session: removed 3 messages, dropped open tasks/questions: 0003", out)
+        self.assertEqual(sorted(p.name[:4] for p in (self.root / ".agents-duo/messages").iterdir()), ["0001"])
+        self.assertFalse((self.root / ".agents-duo/a").exists())
+        self.assertIn("created_by: orchestrator", (self.root / ".agents-duo/session.md").read_text(encoding="utf-8"))
+
+    def test_orchestrator_init_keeps_session_with_active_assistant(self):
+        asst(self.root, "a", "init")  # the assistant joined first
+        out = orch(self.root, "init").stdout
+        self.assertIn("kept session: a already active", out)
+        self.assertIn("PING from a", orch(self.root, "check").stdout)
+        orch(self.root, "send", "--type", "status", "--title", "s", "--body", "x")
+        out = orch(self.root, "init", "--takeover", "--keep").stdout
+        self.assertNotIn("cleared", out)
+        self.assertNotIn("kept session", out)
 
     def test_reset_guard_when_active(self):
         asst(self.root, "a", "init")

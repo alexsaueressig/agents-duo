@@ -16,6 +16,7 @@ All communication goes through `scripts/agents_bus.py`, next to this SKILL.md. R
 ## Start
 
 1. `BUS init --role orchestrator --agent "<Claude Code|Codex|...>"` (add `--feedback-interval N` if the user wants another rhythm than 30s; `--takeover` only if the user confirms an old orchestrator is dead).
+   - This starts a **fresh session**: if no assistant in the old `.agents-duo/` is still active, it is cleared, and the output says what was removed (`cleared previous session: ...`). If it lists dropped open tasks, tell the user. If assistants already joined and are active, it keeps the session (`kept session: ...`). Pass `--keep` only when the user wants to continue the old session.
 2. Tell the user in one line that you're online. Assistants join with `/duo-assistant` or `$duo-assistant` on their platforms. Any number can join, each under its own name.
    - **Agent that can only read and edit files** (a chat agent without shell or Python): run `BUS invite <name>`, then give the user the one line it prints for that agent. Its tasks and replies go through `.agents-duo/<name>/inbox.md` and `outbox.md`, and appear in your `wait` like any other message. It can't report token usage, it doesn't loop on its own (the user nudges it), and its replies show up about 2s after it stops editing.
 3. `BUS wait --role orchestrator` until the assistants' pings arrive. Pings are answered automatically. Ask the user for the goal if you don't have one.
@@ -70,4 +71,4 @@ Don't end your turn while tasks are open.
 
 ## Finish
 
-When everything is accepted and integrated, run the final checks, then `BUS send --role orchestrator --type bye --title "session complete" --body "<summary>"` (goes to all). Give the user a short summary: who did what, the token usage per agent from `BUS status`, and what was verified. Leave the chat folders as history; `/duo-start` resets them.
+When everything is accepted and integrated, run the final checks, then `BUS send --role orchestrator --type bye --title "session complete" --body "<summary>"` (goes to all). Give the user a short summary: who did what, the token usage per agent from `BUS status`, and what was verified. Leave the chat folders as history; the next `/duo-orchestrator` start clears them.

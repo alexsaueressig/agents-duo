@@ -11,7 +11,7 @@ An **orchestrator** (possibly on another platform) sends you tasks through a fil
 
 `scripts/agents_bus.py` sits next to this SKILL.md. Run it from the **project root** with `python`. Never edit `.agents-duo/` by hand.
 
-**Every bus output ends with `NEXT:` lines holding the exact command to run next.** Follow them. You don't need to compose commands yourself.
+**`init`, `wait`, `check` and `pulse` end with `NEXT:` lines holding the exact command to run next.** Follow them. You don't need to compose commands yourself.
 
 `wait` blocks up to 60s. If your shell tool has a timeout, set it to at least 75000 ms. Run it in the foreground.
 
@@ -20,6 +20,7 @@ An **orchestrator** (possibly on another platform) sends you tasks through a fil
 1. **Ask the user for this assistant's name** unless they already gave one (suggest the platform, e.g. `codex`, `claude`, `copilot`). Names use a-z, 0-9 and `-`, and must be unique in the session.
 2. `python "<path>/agents_bus.py" init --role assistant --name <name> --agent "<your platform, e.g. Codex>"`
    - If it says the name looks active, ask the user: pick another name, or re-run with `--takeover` if that old session is dead.
+   - Rejoining under a name that was used before is a **resubscribe**: only your part is reset. Your sent messages stay as history, your unfinished tasks are reported back to the orchestrator as dropped, and older unread messages are skipped. Start from what arrives next, not from anything you remember.
 3. Tell the user in one line that you're online as `<name>`, then follow the `NEXT:` line (wait).
 
 ## The loop
