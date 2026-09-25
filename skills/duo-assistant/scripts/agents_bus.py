@@ -42,6 +42,7 @@ TYPES = ("ping", "pong", "task", "result", "question", "answer", "status", "done
 BROADCAST_TYPES = ("ping", "status", "bye")  # orchestrator sends these to all by default
 MAX_WAIT = 60            # hard cap for a single blocking wait, seconds
 DEFAULT_INTERVAL = 30    # default feedback interval, seconds
+BUSY_GRACE = 1800        # an agent with an open task counts as active this long after last seen (slow models)
 BASE_DIR = ".agents-duo"      # everything the bus writes lives under this one folder
 MSG_DIR = "messages"          # message bodies, inside BASE_DIR
 MSG_FROM_AGENT = f"../{MSG_DIR}"  # body path as written in index lines (relative to an agent folder)
@@ -363,6 +364,12 @@ def open_items(chat):
                   key=lambda e: e["id"])
 
 
+def busy_names(chat):
+    """Names with an open task; a task broadcast to all keeps every assistant busy."""
+    to = {e["to"] for e in open_items(chat) if e["type"] == "task"}
+    return set(assistants(chat)) | to if ALL in to else to
+
+
 def resubscribe(root_arg, chat, me):
     """A returning assistant starts over under the same name: its history stays (the orchestrator's cursor
     counts its index lines), its unfinished tasks are closed as dropped so the orchestrator can resend
@@ -670,16 +677,18 @@ def silence_note(chat, me):
     act = active_assistants(chat)
     if not act:
         return "no assistant has joined yet"
+    busy = busy_names(chat)
     parts, warns = [], []
     for n in act:
         age = last_seen(chat, n)
         plain = is_plain(chat, n)
-        parts.append(f"{n}{' (plain)' if plain else ''} {fmt_age(age)}")
-        if not plain and age is not None and age > 3 * feedback_interval(chat, n):
+        parts.append(f"{n}{' (plain)' if plain else ''} {fmt_age(age)}{' (busy)' if n in busy else ''}")
+        limit = (10 if n in busy else 3) * feedback_interval(chat, n)  # slow models may not pulse mid-task
+        if not plain and age is not None and age > limit:
             warns.append(f"{n} silent for {int(age)}s")
     note = "assistants last seen: " + ", ".join(parts)
     if warns:
-        note += " | WARNING: " + ", ".join(warns) + " (> 3x feedback interval)"
+        note += " | WARNING: " + ", ".join(warns) + " (> 3x feedback interval, 10x while busy)"
     return note
 
 
@@ -793,7 +802,7 @@ def cmd_init(a):
             cleared = f"kept session: {', '.join(n for n, _ in others)} already active"
         else:
             cleared = "cleared previous session: " + clear_session(root, chat, data, ORCH)
-    created = create_session(root, chat, me)
+    created = create_session(root, chat, me) or cleared.startswith("cleared")
     agent_dir(chat, me).mkdir(exist_ok=True)
     idx = index_file(chat, me)
     note = resubscribe(a.root, chat, me) if me != ORCH and idx.exists() else ""
@@ -916,11 +925,14 @@ def cmd_status(a):
 
 
 def active_others(chat, me=None):
-    """[(name, seconds since last seen)] of participants other than <me> that still look active."""
+    """[(name, seconds since last seen)] of participants other than <me> that still look active: seen within
+    3x the feedback interval, or within BUSY_GRACE while a task to them is open (slow models may not pulse)."""
+    busy = busy_names(chat)
     out = []
     for n in participants(chat):
         age = last_seen(chat, n)
-        if n != me and age is not None and age < 3 * feedback_interval(chat, n) and not departed(chat, n):
+        limit = BUSY_GRACE if n in busy else 3 * feedback_interval(chat, n)
+        if n != me and age is not None and age < limit and not departed(chat, n):
             out.append((n, age))
     return out
 

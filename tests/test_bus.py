@@ -260,11 +260,11 @@ class BusTest(unittest.TestCase):
         orch(self.root, "init")
         asst(self.root, "a", "init")
         orch(self.root, "send", "--type", "task", "--title", "old", "--body", "x")
-        old = time.time() - 600  # both agents stopped long ago
+        old = time.time() - 3600  # both agents stopped long ago, past the busy grace too
         for p in (self.root / ".agents-duo").rglob("*"):
             os.utime(p, (old, old))
         out = orch(self.root, "init", "--takeover").stdout
-        self.assertIn("cleared previous session: removed 3 messages, dropped open tasks/questions: 0003", out)
+        self.assertIn("session=created ping=[0001] | cleared previous session: removed 3 messages, dropped open tasks/questions: 0003", out)
         self.assertEqual(sorted(p.name[:4] for p in (self.root / ".agents-duo/messages").iterdir()), ["0001"])
         self.assertFalse((self.root / ".agents-duo/a").exists())
         self.assertIn("created_by: orchestrator", (self.root / ".agents-duo/session.md").read_text(encoding="utf-8"))
@@ -278,6 +278,27 @@ class BusTest(unittest.TestCase):
         out = orch(self.root, "init", "--takeover", "--keep").stdout
         self.assertNotIn("cleared", out)
         self.assertNotIn("kept session", out)
+
+    def test_busy_slow_assistant_keeps_session(self):
+        import os
+        orch(self.root, "init")
+        asst(self.root, "a", "init")
+        orch(self.root, "send", "--type", "task", "--title", "slow work", "--body", "x")
+        old = time.time() - 300  # silent for 5 min, far past 3x interval, but its task is still open
+        for p in (self.root / ".agents-duo").rglob("*"):
+            os.utime(p, (old, old))
+        self.assertIn("kept session: a already active", orch(self.root, "init", "--takeover").stdout)
+        self.assertEqual(bus(self.root, "reset", check=False).returncode, 3)
+
+    def test_busy_broadcast_task_keeps_session(self):
+        import os
+        orch(self.root, "init")
+        asst(self.root, "a", "init")
+        orch(self.root, "send", "--to", "all", "--type", "task", "--title", "slow work", "--body", "x")
+        old = time.time() - 300  # a task to all keeps every assistant busy
+        for p in (self.root / ".agents-duo").rglob("*"):
+            os.utime(p, (old, old))
+        self.assertIn("kept session: a already active", orch(self.root, "init", "--takeover").stdout)
 
     def test_reset_guard_when_active(self):
         asst(self.root, "a", "init")

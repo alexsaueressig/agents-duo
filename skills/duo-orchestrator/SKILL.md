@@ -66,7 +66,7 @@ Don't end your turn while tasks are open.
 - `status`: note it. If it shows the assistant going the wrong way, correct it right away.
 - `result`: **review it** (read the changed files, run the acceptance check if it's cheap), then `done --reply-to <id>` or a follow-up `task`.
 - `ASSISTANT_LEFT: <name>`: don't send it more work. Reassign its open tasks if needed.
-- A `WARNING ... silent`: send that assistant one `ping` (`--to <name>`). If it's still silent, tell the user and reassign only with their OK.
+- A `WARNING ... silent`: send that assistant one `ping` (`--to <name>`), then keep waiting calmly. Slow models can take many minutes on a task, and every extra message costs tokens on both sides. If it's still silent after that, tell the user and reassign only with their OK.
 - Change the rhythm: `BUS send --role orchestrator --type status --title "check every Ns" --body "..." --feedback-interval N` (add `--to <name>` to change it for one assistant only).
 
 ## Finish
