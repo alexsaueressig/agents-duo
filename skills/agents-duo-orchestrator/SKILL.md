@@ -1,6 +1,6 @@
 ---
-name: be-orchestrator
-description: Act as the ORCHESTRATOR in a two-agent team where Claude Code and Codex (or any two AI coding agents) work together on the same project through shared Markdown files (.agents-chat/*.md and .agents-transfer-data/*.md). Plans the work, splits it into tasks, delegates to the assistant agent, watches for replies and reviews the results, so tokens and processing are spread across two platforms. Use it whenever the user types /be-orchestrator or $be-orchestrator, asks you to "orchestrate", "lead", "coordinate" or "delegate to Codex/Claude/the other agent", wants two agents or two platforms working together, wants to split token usage between Claude and Codex, or mentions .agents-chat or .agents-transfer-data, even if they don't name this skill.
+name: agents-duo-orchestrator
+description: Act as the ORCHESTRATOR in a two-agent team where Claude Code and Codex (or any two AI coding agents) work together on the same project through shared Markdown files (.agents-chat/*.md and .agents-transfer-data/*.md). Plans the work, splits it into tasks, delegates to the assistant agent, watches for replies and reviews the results, so tokens and processing are spread across two platforms. Use it whenever the user types /agents-duo-orchestrator or $agents-duo-orchestrator, asks you to "orchestrate", "lead", "coordinate" or "delegate to Codex/Claude/the other agent", wants two agents or two platforms working together, wants to split token usage between Claude and Codex, or mentions .agents-chat or .agents-transfer-data, even if they don't name this skill.
 ---
 
 # Be the orchestrator
@@ -9,7 +9,7 @@ You lead a two-agent team. The other agent is the **assistant**, usually running
 
 ## The bus
 
-All communication goes through `scripts/agents_bus.py`, which sits next to this SKILL.md. Resolve its absolute path from this skill's directory (for example `~/.claude/skills/be-orchestrator/scripts/agents_bus.py` or `~/.codex/skills/be-orchestrator/scripts/agents_bus.py`). Run it from the **project root** with `python`. Below, `BUS` means `python "<that path>"`.
+All communication goes through `scripts/agents_bus.py`, which sits next to this SKILL.md. Resolve its absolute path from this skill's directory (for example `~/.claude/skills/agents-duo-orchestrator/scripts/agents_bus.py` or `~/.codex/skills/agents-duo-orchestrator/scripts/agents_bus.py`). Run it from the **project root** with `python`. Below, `BUS` means `python "<that path>"`.
 
 Never edit `.agents-chat/` or `.agents-transfer-data/` by hand, and never write to `assistant.md`. Each file has exactly one writer, and that's what keeps two agents from overwriting each other. `references/protocol.md` has the full format if you need it.
 
@@ -18,7 +18,7 @@ Never edit `.agents-chat/` or `.agents-transfer-data/` by hand, and never write 
 ## Start
 
 1. `BUS init --role orchestrator --agent "<Claude Code|Codex>"`. This creates the folders and `session.md` if they're missing, then sends a `ping` that tells the assistant to give feedback every 30s. If the user asked for a different rhythm, pass `--feedback-interval N`. If init warns that another orchestrator is active and the user confirms the old session is dead, re-run it with `--takeover`.
-2. Tell the user in one line that you're online and waiting for the assistant. The assistant is started separately with `/be-assistant` or `$be-assistant` on the other platform.
+2. Tell the user in one line that you're online and waiting for the assistant. The assistant is started separately with `/agents-duo-assistant` or `$agents-duo-assistant` on the other platform.
 3. Run `BUS wait --role orchestrator` until the assistant's ping or pong arrives. Answer its `ping` with a `pong`:
    `BUS send --role orchestrator --type pong --reply-to <id> --title "hello" --body "ok"`.
 

@@ -6,8 +6,8 @@
     python install.py --codex      # Codex only
     python install.py --dest DIR   # any other skills directory
 
-Shared files (agents_bus.py, protocol.md) live in skills/be-orchestrator and are
-synced into skills/be-assistant first, so each installed skill is self-contained.
+Shared files (agents_bus.py, protocol.md) live in skills/agents-duo-orchestrator and are
+synced into skills/agents-duo-assistant first, so each installed skill is self-contained.
 """
 import argparse
 import shutil
@@ -15,13 +15,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SKILLS = ROOT / "skills"
-NAMES = ("be-orchestrator", "be-assistant")
+NAMES = ("agents-duo-orchestrator", "agents-duo-assistant")
 SHARED = ("scripts/agents_bus.py", "references/protocol.md")
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "*.tmp")
 
 
 def sync_shared():
-    src, dst = SKILLS / "be-orchestrator", SKILLS / "be-assistant"
+    src, dst = SKILLS / "agents-duo-orchestrator", SKILLS / "agents-duo-assistant"
     for rel in SHARED:
         (dst / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src / rel, dst / rel)

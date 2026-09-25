@@ -1,6 +1,6 @@
 ---
-name: be-assistant
-description: Act as the ASSISTANT in a two-agent team where Claude Code and Codex (or any two AI coding agents) work together on the same project through shared Markdown files (.agents-chat/*.md and .agents-transfer-data/*.md). Joins or creates the session, pings the orchestrator, waits for tasks, runs them within the files it's given, reports progress every feedback interval and sends back verified results, so tokens and processing are spread across two platforms. Use it whenever the user types /be-assistant or $be-assistant, says "be the assistant", "help the other agent", "take tasks from Claude/Codex" or "wait for the orchestrator", wants two agents or platforms working together, or mentions .agents-chat or .agents-transfer-data, even if they don't name this skill.
+name: agents-duo-assistant
+description: Act as the ASSISTANT in a two-agent team where Claude Code and Codex (or any two AI coding agents) work together on the same project through shared Markdown files (.agents-chat/*.md and .agents-transfer-data/*.md). Joins or creates the session, pings the orchestrator, waits for tasks, runs them within the files it's given, reports progress every feedback interval and sends back verified results, so tokens and processing are spread across two platforms. Use it whenever the user types /agents-duo-assistant or $agents-duo-assistant, says "be the assistant", "help the other agent", "take tasks from Claude/Codex" or "wait for the orchestrator", wants two agents or platforms working together, or mentions .agents-chat or .agents-transfer-data, even if they don't name this skill.
 ---
 
 # Be the assistant
@@ -9,7 +9,7 @@ You're the second agent in a two-agent team. The **orchestrator**, usually on an
 
 ## The bus
 
-All communication goes through `scripts/agents_bus.py`, which sits next to this SKILL.md. Resolve its absolute path from this skill's directory (for example `~/.codex/skills/be-assistant/scripts/agents_bus.py` or `~/.claude/skills/be-assistant/scripts/agents_bus.py`). Run it from the **project root** with `python`. Below, `BUS` means `python "<that path>"`.
+All communication goes through `scripts/agents_bus.py`, which sits next to this SKILL.md. Resolve its absolute path from this skill's directory (for example `~/.codex/skills/agents-duo-assistant/scripts/agents_bus.py` or `~/.claude/skills/agents-duo-assistant/scripts/agents_bus.py`). Run it from the **project root** with `python`. Below, `BUS` means `python "<that path>"`.
 
 Never edit `.agents-chat/` or `.agents-transfer-data/` by hand, and never write to `orchestrator.md`. Each file has exactly one writer, and that's what keeps the two agents from overwriting each other. `references/protocol.md` has the full format if you need it.
 

@@ -29,7 +29,7 @@ How two AI agents (for example Claude Code and Codex) work together through file
 | Type | Sent by | Meaning |
 |---|---|---|
 | `ping` / `pong` | both | Presence. Every ping gets a pong. |
-| `task` | orchestrator | A unit of work (see the task template in be-orchestrator). |
+| `task` | orchestrator | A unit of work (see the task template in agents-duo-orchestrator). |
 | `result` | assistant | The finished task. `--reply-to <task id>`. |
 | `question` / `answer` | both | Clarification. The answer uses `--reply-to`. |
 | `status` | both | Progress heartbeat. The orchestrator may add `feedback_interval`. |

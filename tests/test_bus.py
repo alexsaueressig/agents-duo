@@ -6,7 +6,7 @@ import time
 import unittest
 from pathlib import Path
 
-BUS = Path(__file__).resolve().parents[1] / "skills" / "be-orchestrator" / "scripts" / "agents_bus.py"
+BUS = Path(__file__).resolve().parents[1] / "skills" / "agents-duo-orchestrator" / "scripts" / "agents_bus.py"
 
 
 def bus(root, *args, check=True):

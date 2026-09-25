@@ -7,12 +7,14 @@ Run two AI coding agents on the same project, usually on two different platforms
 The only thing they share is the project folder. There's no server, no MCP and no network.
 
 ```
-you ──► Claude Code (/be-orchestrator) ─┐                     ┌─ Codex ($be-assistant)
-                                        ▼                     ▼
-                        .agents-chat/orchestrator.md   .agents-chat/assistant.md
-                                        │     .agents-transfer-data/     │
-                                        └──► 0003-orchestrator-task-… ◄──┘
-                                             0004-assistant-result-…
+Claude Code: /agents-duo-orchestrator          Codex: $agents-duo-assistant
+            │ writes only                                │ writes only
+            ▼                                            ▼
+.agents-chat/orchestrator.md                 .agents-chat/assistant.md
+            │ points to                                  │ points to
+            └──────────► .agents-transfer-data/ ◄────────┘
+                           0003-orchestrator-task-….md
+                           0004-assistant-result-….md
 ```
 
 Either platform can take either role. Both skills are installed on both.
@@ -32,12 +34,12 @@ python install.py            # installs into ~/.claude/skills and ~/.codex/skill
 
 In the same project folder:
 
-1. **Claude Code:** `/be-orchestrator`, then describe the goal.
-2. **Codex:** `$be-assistant`
+1. **Claude Code:** `/agents-duo-orchestrator`, then describe the goal.
+2. **Codex:** `$agents-duo-assistant`
 
 Either can start first. Whoever starts first creates the session and sends a `ping`, and the other answers with a `pong`. From then on both keep watching the folder. The orchestrator sends tasks, and the assistant sends progress updates and then results. Either side can end the session with `bye`.
 
-To swap roles, run `$be-orchestrator` in Codex and `/be-assistant` in Claude.
+To swap roles, run `$agents-duo-orchestrator` in Codex and `/agents-duo-assistant` in Claude.
 
 ## How the file concurrency problem is solved
 
@@ -69,12 +71,12 @@ The core rule is that **every file has exactly one writer.**
 The skills drive this for you, but you can also inspect a session by hand:
 
 ```bash
-BUS=~/.claude/skills/be-orchestrator/scripts/agents_bus.py
+BUS=~/.claude/skills/agents-duo-orchestrator/scripts/agents_bus.py
 python $BUS status            # roles, last seen, open tasks
 python $BUS read --id 3       # print one message
 ```
 
-Commands: `init`, `send`, `wait`, `check`, `pulse`, `status`, `read`. Run with `-h` for details. The full protocol is in [`skills/be-orchestrator/references/protocol.md`](skills/be-orchestrator/references/protocol.md).
+Commands: `init`, `send`, `wait`, `check`, `pulse`, `status`, `read`. Run with `-h` for details. The full protocol is in [`skills/agents-duo-orchestrator/references/protocol.md`](skills/agents-duo-orchestrator/references/protocol.md).
 
 ## Notes
 
@@ -88,7 +90,7 @@ Commands: `init`, `send`, `wait`, `check`, `pulse`, `status`, `read`. Run with `
 python -m unittest discover -s tests
 ```
 
-Edit shared files (`agents_bus.py`, `protocol.md`) in `skills/be-orchestrator/`. `install.py` copies them into `be-assistant`.
+Edit shared files (`agents_bus.py`, `protocol.md`) in `skills/agents-duo-orchestrator/`. `install.py` copies them into `agents-duo-assistant`.
 
 ## License
 
