@@ -34,11 +34,12 @@ import sys
 import time
 from pathlib import Path
 
-PROTOCOL = 2
+PROTOCOL = 3
 ORCH = "orchestrator"
 ALL = "all"
 ROLES = (ORCH, "assistant")
-TYPES = ("ping", "pong", "task", "result", "question", "answer", "status", "done", "bye")
+TYPES = ("ping", "pong", "task", "result", "question", "answer", "status", "done", "revise", "cancel", "bye")
+TERMINAL_STATES = ("accepted", "cancelled")
 BROADCAST_TYPES = ("ping", "status", "bye")  # orchestrator sends these to all by default
 MAX_WAIT = 60            # hard cap for a single blocking wait, seconds
 DEFAULT_INTERVAL = 30    # default feedback interval, seconds
@@ -158,7 +159,8 @@ def parse_plain(chat, name):
         mtype = PLAIN_TYPES[m.group(1).lower()]
         title = next((ln.strip() for ln in body.splitlines() if ln.strip()), mtype)[:80]
         out.append({"id": 0, "ts": ts, "type": mtype, "re": int(m.group(2)) if m.group(2) else None,
-                    "to": ORCH, "title": title, "path": "", "from": name, "body": body, "plain": True})
+                    "to": ORCH, "title": title, "path": "", "from": name, "body": body, "plain": True,
+                    "key": f"plain-{name}-{i + 1}"})
     return out
 
 
@@ -170,9 +172,17 @@ def plain_header(name):
         f"1. First, create `{BASE_DIR}/{name}/outbox.md` with one line: `## hello`. That file is yours: "
         f"only you write it, and you only ever add to its end. Never edit anything else in `{BASE_DIR}/`.\n"
         f"2. New messages are added at the bottom of this file as `## [0005] task: <title>`.\n"
-        f"3. Do each task. Edit only the files the task says you own.\n"
-        f"4. When done, add to the end of `{BASE_DIR}/{name}/outbox.md`:\n\n"
-        f"   ```\n   ## reply 0005\n   <what you did, which files changed, how you checked it>\n   ```\n\n"
+        f"3. Do each task. Edit only the files the task says you own. Preparation and execution are separate "
+        f"tasks. A `status` is informational; wait for a task with the command and expected outputs before "
+        f"starting a new phase. A `revise` message requests corrections to the referenced task.\n"
+        f"4. To submit a result for review, add to the end of `{BASE_DIR}/{name}/outbox.md`:\n\n"
+        f"   ```\n   ## reply 0005\n   <summary and changed files>\n"
+        f"   | Criterion | Status | Evidence |\n   |---|---|---|\n"
+        f"   | <each assigned criterion, verbatim> | passed / failed / unverified | <file link and finding, or gap> |\n"
+        f"   Usage: <available measurements and source, or unavailable>\n   ```\n\n"
+        f"   Cover every criterion, including complete content when requested; sampling is not a full check. "
+        f"Your reply leaves the task open for review. Only the orchestrator's `done` accepts it; `cancel` "
+        f"closes it without acceptance. Do not repeat checks while waiting for review.\n"
         f"   If the task is unclear, add `## question 0005` with your question instead, and wait for the answer "
         f"here.\n"
         f"5. Then read this file again for the next message. If there is none yet, tell the user you are waiting "
@@ -356,28 +366,84 @@ def feedback_interval(chat, me=ALL):
     return DEFAULT_INTERVAL
 
 
+def message_key(entry):
+    return entry.get("key", str(entry["id"]))
+
+
+def task_states(chat):
+    """Project immutable messages into one task state per assignee. Results never close tasks.
+
+    Review decisions record the exact result they reviewed. Plain-file results use their append-only
+    section number as a stable key, so re-reading an outbox cannot invalidate an earlier decision.
+    """
+    idx = {n: parse_index(chat, n) for n in participants(chat)}
+    orchestrator = sorted(idx.get(ORCH, []), key=lambda e: e["id"])
+    tasks = [e for e in orchestrator if e["type"] == "task"]
+    states = []
+    for task in tasks:
+        if task["to"] == ALL:
+            # v2 did not snapshot broadcast recipients; retain its current-participant semantics.
+            owners = entry_fm(chat, task).get("assignees", "").split(",")
+            owners = [n for n in owners if n] or assistants(chat)
+        else:
+            owners = [task["to"]]
+        for owner in owners:
+            results = [e for e in idx.get(owner, []) if e["type"] == "result" and e["re"] == task["id"]
+                       and (e.get("plain") or e["id"] > task["id"])]
+            by_id = {e["id"]: e for e in results if e["id"]}
+            by_key = {message_key(e): e for e in results}
+            result = results[-1] if results else None
+            state = "submitted" if result else "assigned"
+            for action in orchestrator:
+                if action["id"] <= task["id"] or action["to"] not in (owner, ALL):
+                    continue
+                if action["type"] not in ("done", "revise", "cancel"):
+                    continue
+                if action["re"] != task["id"] and action["re"] not in by_id:
+                    continue
+                reviewed = entry_fm(chat, action).get("reviewed_result")
+                recorded_review = bool(reviewed)
+                if not reviewed:  # also understand existing v2 done messages
+                    prior = [e for e in results if e.get("plain") or e["id"] < action["id"]]
+                    target = by_id.get(action["re"]) or (prior[-1] if prior else None)
+                    reviewed = message_key(target) if target else ""
+                if action["type"] == "cancel":
+                    state = "cancelled"
+                elif recorded_review or reviewed in by_key:
+                    if action["type"] == "done":
+                        state = "accepted"
+                        result = by_key.get(reviewed, result)
+                    else:
+                        state = "revision_requested" if not result or message_key(result) == reviewed else "submitted"
+                if state in TERMINAL_STATES:
+                    break
+            states.append(dict(task, owner=owner, state=state, result=result))
+    return states
+
+
 def open_items(chat):
-    """Tasks and questions nobody has answered with a result/answer/done yet, by id."""
+    """Unaccepted tasks (including submitted results) and unanswered questions, by id."""
+    tasks = {e["id"]: e for e in task_states(chat) if e["state"] not in TERMINAL_STATES}
     everything = [e for n in participants(chat) for e in parse_index(chat, n)]
-    replied = {e["re"] for e in everything if e["re"] and e["type"] in ("result", "answer", "done")}
-    return sorted((e for e in everything if e["type"] in ("task", "question") and e["id"] and e["id"] not in replied),
-                  key=lambda e: e["id"])
+    answered = {e["re"] for e in everything if e["re"] and e["type"] == "answer"}
+    questions = [e for e in everything if e["type"] == "question" and e["id"] and e["id"] not in answered]
+    return sorted(list(tasks.values()) + questions, key=lambda e: e["id"])
 
 
 def busy_names(chat):
-    """Names with an open task; a task broadcast to all keeps every assistant busy."""
-    to = {e["to"] for e in open_items(chat) if e["type"] == "task"}
-    return set(assistants(chat)) | to if ALL in to else to
+    """Both working and awaiting-review tasks retain the busy grace period."""
+    return {e["owner"] for e in task_states(chat) if e["state"] not in TERMINAL_STATES}
 
 
 def resubscribe(root_arg, chat, me):
     """A returning assistant starts over under the same name: its history stays (the orchestrator's cursor
-    counts its index lines), its unfinished tasks are closed as dropped so the orchestrator can resend
+    counts its index lines), its unfinished tasks are reported as dropped so the orchestrator can resend
     them, the unread backlog is skipped and the usage cache is cleared. Returns a short note."""
-    dropped = [e for e in open_items(chat) if e["type"] == "task" and e["to"] == me]
+    dropped = [e for e in task_states(chat) if e["owner"] == me and e["state"] in ("assigned", "revision_requested")]
     for e in dropped:
         do_send(root_arg, me, "result", "dropped: assistant resubscribed",
-                f"Task {e['id']:04d} was not finished before '{me}' restarted. Resend it if it is still needed.",
+                f"Task {e['id']:04d} was not finished before '{me}' restarted. All remaining criteria are unverified. "
+                "It remains open for review; cancel it before sending a replacement task if still needed.",
                 ORCH, e["id"])
     cf = cursor_file(chat, me)
     with locked(cf):
@@ -436,6 +502,9 @@ def resolve_to(chat, me, mtype, to, reply_to):
         for n in assistants(chat):
             if any(e["id"] == int(reply_to) for e in parse_index(chat, n)):
                 return n
+        for e in parse_index(chat, ORCH):
+            if e["id"] == int(reply_to) and e["type"] == "task" and e["to"] != ALL:
+                return e["to"]
     if mtype in BROADCAST_TYPES:
         return ALL
     act = active_assistants(chat)
@@ -586,9 +655,52 @@ def active_for(chat, name):
 
 # ---------------------------------------------------------------- core ops
 
+def validate_task_message(chat, me, mtype, to, reply_to):
+    """Validate lifecycle transitions before claiming an id or writing a message."""
+    if mtype not in ("task", "result", "done", "revise", "cancel"):
+        return {}
+    if mtype in ("task", "done", "revise", "cancel") and me != ORCH:
+        sys.exit(f"ERROR: only the orchestrator can send {mtype}.")
+    if mtype == "task":
+        if to == ALL:
+            names = active_assistants(chat)
+            if not names:
+                sys.exit("ERROR: a broadcast task needs at least one active assistant.")
+            return {"assignees": ",".join(names)}
+        return {}
+    if mtype == "result" and me == ORCH:
+        sys.exit("ERROR: only assistants submit results.")
+    if not reply_to:
+        sys.exit(f"ERROR: {mtype} requires --reply-to <task id or result id>.")
+    states = task_states(chat)
+    if mtype == "result":
+        matches = [e for e in states if e["id"] == reply_to and e["owner"] == me]
+    else:
+        if to == ALL:
+            sys.exit(f"ERROR: {mtype} must target one assistant; use --to <name> for a broadcast task.")
+        result_refs = {e["id"]: e["re"] for e in parse_index(chat, to) if e["type"] == "result" and e["id"]}
+        task_id = result_refs.get(reply_to, reply_to)
+        matches = [e for e in states if e["id"] == task_id and e["owner"] == to]
+    if not matches:
+        sys.exit("ERROR: reply must reference a task assigned to this assistant (or its result for review).")
+    task = matches[0]
+    if task["state"] in TERMINAL_STATES:
+        sys.exit(f"ERROR: task {task['id']:04d} is already {task['state']}.")
+    if mtype in ("done", "revise"):
+        result = task["result"]
+        if task["state"] != "submitted" or not result:
+            sys.exit(f"ERROR: {mtype} requires a submitted result awaiting review.")
+        if reply_to != task["id"] and reply_to != result["id"]:
+            sys.exit("ERROR: review the latest result; the referenced result has been superseded.")
+        return {"reviewed_result": message_key(result)}
+    return {}
+
+
 def do_send(root, me, mtype, title, body, to, reply_to=None, extra=None):
     root, chat, data = paths(root)
     require_session(chat)
+    extra = dict(extra or {})
+    extra.update(validate_task_message(chat, me, mtype, to, reply_to))
     data.mkdir(parents=True, exist_ok=True)
     mid = claim_id(chat)
     title = " ".join(title.replace("|", "/").split())[:120] or mtype
@@ -597,9 +709,8 @@ def do_send(root, me, mtype, title, body, to, reply_to=None, extra=None):
         "id": mid, "from": me, "to": to, "type": mtype,
         "reply_to": reply_to or "", "created": now_iso(), "title": title,
     }
-    extra = dict(extra or {})
     if not extra.get("usage"):
-        extra["usage"] = measure_usage(root, chat, me, extra.get("agent") or agent_label(chat, me))
+        extra["usage"] = measure_usage(root, chat, me, extra.get("agent") or agent_label(chat, me)) or "unavailable"
     fm.update({k: " ".join(str(v).split()) for k, v in extra.items() if v})
     text = "---\n" + "".join(f"{k}: {v}\n" for k, v in fm.items()) + "---\n\n" + (body or "").rstrip() + "\n"
     tmp = data / (name + ".tmp")
@@ -702,19 +813,36 @@ def next_hints(root_arg, me, msgs):
     """NEXT: lines for assistants. The orchestrator gets none (it follows its skill)."""
     if me == ORCH:
         return []
+    if any(e["type"] == "bye" for e in msgs):
+        return ["NEXT: the orchestrator ended the session. Stop and summarize your work for the user."]
+    chat = paths(root_arg)[1]
+    tasks = [e for e in task_states(chat) if e["owner"] == me and e["state"] not in TERMINAL_STATES]
+    answered = {e["re"] for e in parse_index(chat, ORCH) if e["type"] == "answer"}
+    questions = {e["re"] for e in parse_index(chat, me) if e["type"] == "question" and e["id"] not in answered}
+    working = [e for e in tasks if e["state"] in ("assigned", "revision_requested") and e["id"] not in questions]
     out = []
-    for e in msgs:
-        if e["type"] == "bye":
-            return ["NEXT: the orchestrator ended the session. Stop and summarize your work for the user."]
-        if e["type"] == "task":
-            out.append(f"NEXT: do task {e['id']:04d} (only touch the files it allows). About every "
-                       f"{feedback_interval(paths(root_arg)[1], me)}s report progress with: "
-                       f"{bus_cmd(root_arg, me, 'pulse')} --reply-to {e['id']} --note \"<progress>\"")
-            out.append(f"NEXT: when finished: {bus_cmd(root_arg, me, 'send')} --type result --reply-to {e['id']} "
-                       f"--title \"<one-line outcome>\" --body \"<changed files, how you verified, open questions>\"")
+    for e in working:
+        fresh = any((m["type"] == "task" and m["id"] == e["id"]) or
+                    (m["type"] == "revise" and m["re"] in (e["id"], (e["result"] or {}).get("id"))) for m in msgs)
+        out.append(f"NEXT: {'do' if fresh else 'continue'} task {e['id']:04d} ({e['state']}; only touch the files it allows). "
+                   f"A status message is informational, not a new assignment. About every {feedback_interval(chat, me)}s "
+                   f"report progress with: {bus_cmd(root_arg, me, 'pulse')} --reply-to {e['id']} --note \"<progress>\"")
+        if fresh:
+            out.append(f"NEXT: when the assigned phase is finished, submit for review: {bus_cmd(root_arg, me, 'send')} "
+                       f"--type result --reply-to {e['id']} --title \"<one-line outcome>\" "
+                       '--body-file "<report.md outside the project>"')
+            out.append("NEXT: report every acceptance criterion verbatim as passed, failed, or unverified, with an "
+                       "evidence link and finding (or reason for the gap); include changed files and usage or unavailable. "
+                       "Submission is not acceptance. Preparation and execution require separate tasks.")
             out.append(f"NEXT: if the task is unclear, ask first: {bus_cmd(root_arg, me, 'send')} --type question "
                        f"--reply-to {e['id']} --title \"<question>\" --body \"<details>\"")
-    return out + [f"NEXT: then wait again: {bus_cmd(root_arg, me, 'wait')}"]
+    if working:
+        return out
+    if tasks:
+        ids = ", ".join(f"{e['id']:04d}" for e in tasks)
+        return [f"NEXT: tasks {ids} await orchestrator review or an answer. Do not repeat checks or start a new phase "
+                f"from a status message. Wait: {bus_cmd(root_arg, me, 'wait')}"]
+    return [f"NEXT: run the same wait again: {bus_cmd(root_arg, me, 'wait')}"]
 
 
 def auto_pong(root_arg, chat, me, msgs):
@@ -748,8 +876,8 @@ def poll(root_arg, me, timeout, interval, max_chars):
             break
         time.sleep(min(interval, max(0.05, deadline - time.time())))
     print(f"NO_NEW_MESSAGES (waited {int(timeout)}s) | {silence_note(chat, me)}")
-    if me != ORCH:
-        print(f"NEXT: run the same wait again: {bus_cmd(root_arg, me, 'wait')}")
+    for line in next_hints(root_arg, me, []):
+        print(line)
     return False
 
 
@@ -785,6 +913,8 @@ def ensure_gitignore(root):
 
 def cmd_init(a):
     me = identity(a)
+    if me != ORCH and (a.feedback_interval or a.keep):
+        sys.exit("ERROR: only the orchestrator sets feedback_interval or uses --keep.")
     root, chat, data = paths(a.root)
     chat.mkdir(parents=True, exist_ok=True)
     data.mkdir(parents=True, exist_ok=True)
@@ -821,8 +951,6 @@ def cmd_init(a):
         extra = {"feedback_interval": f"{iv}s", "agent": a.agent}
         to = ALL
     else:
-        if a.feedback_interval:
-            sys.exit("ERROR: only the orchestrator sets feedback_interval.")
         body = (f"Assistant '{me}' online (agent: {a.agent}). Ready for tasks. "
                 f"Will follow the orchestrator's feedback_interval (default {DEFAULT_INTERVAL}s).")
         if note:
@@ -912,16 +1040,23 @@ def cmd_status(a):
         print(f"- {n}{role}{f' [{agent}]' if agent else ''}: last seen {fmt_age(last_seen(chat, n))}, "
               f"active {active_for(chat, n) or '0m'}, sent {len(own)}, {last_s}, unread: {n_unread}{left}")
         usage, at = latest_usage(chat, n)
-        print(f"    usage: {usage} (reported {at})" if usage else "    usage: not reported")
+        print(f"    usage: {usage} (reported {at})" if usage else "    usage: unavailable (not reported)")
     if not assistants(chat):
         print("- assistants: none joined")
     items = open_items(chat)
     if items:
-        print("open tasks/questions (no result/answer yet):")
+        print("open tasks/questions (tasks require orchestrator acceptance or cancellation):")
         for e in items:
-            print(f"  [{e['id']:04d}] {e['type']} {e['from']} -> {e['to']}: {e['title']}")
+            if e["type"] == "question":
+                print(f"  [{e['id']:04d}] question {e['from']} -> {e['to']}: {e['title']}")
     else:
         print("open tasks/questions: none")
+    states = task_states(chat)
+    if states:
+        print("task states:")
+        for e in states:
+            result = f" | result={message_key(e['result'])}" if e["result"] else ""
+            print(f"  [{e['id']:04d}] {e['state']} -> {e['owner']}: {e['title']}{result}")
 
 
 def active_others(chat, me=None):

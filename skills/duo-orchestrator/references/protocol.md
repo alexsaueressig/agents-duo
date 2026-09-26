@@ -1,4 +1,4 @@
-# Agents duo protocol (v2)
+# Agents duo protocol (v3)
 
 How one orchestrator and any number of assistants (Claude Code, Codex, GPT, Copilot, …) work together through files in the project root. The SKILL.md files hold the everyday workflow.
 
@@ -29,11 +29,11 @@ Everything lives under `.agents-duo/`, with one folder per participant:
 - [0008] 2026-09-25T14:05:40Z result re:0005 -> orchestrator: header refactored | ../messages/0008-codex-result-header-refactored.md
 ```
 
-**Body:** front matter (`id`, `from`, `to`, `type`, `reply_to`, `created`, `title`, and optionally `feedback_interval`, `agent`, `name`, `usage`), then free Markdown.
+**Body:** front matter (`id`, `from`, `to`, `type`, `reply_to`, `created`, `title`, and optionally `feedback_interval`, `agent`, `name`, `usage`), then free Markdown. Broadcast tasks record `assignees` at send time. Review decisions record `reviewed_result` (a message ID, or `plain-<name>-<section-number>` for an outbox result).
 
 **Cursors** count index lines read per source, not ids. Concurrent sends can append ids out of order, and counting lines means nothing is skipped or delivered twice.
 
-**Resubscribe:** `init` under an assistant name whose `index.md` exists resets only that assistant's part. Its index and bodies stay (the orchestrator's cursor counts those lines), each of its open tasks gets a `result` titled `dropped: assistant resubscribed`, its cursor jumps to the end (the unread backlog is skipped), `usage.json` is deleted, and it pings the orchestrator again. The whole session is reset only by the orchestrator: its `init` clears an old session when no assistant is active (`--keep` to join it instead), and `reset` does it by hand.
+**Resubscribe:** `init` under an assistant name whose `index.md` exists resets only that assistant's part. Its index and bodies stay (the orchestrator's cursor counts those lines), each task still assigned or awaiting revision gets an incomplete `result` titled `dropped: assistant resubscribed`, its cursor jumps to the end (the unread backlog is skipped), `usage.json` is deleted, and it pings the orchestrator again. These results remain open for review/cancellation; previously submitted results are preserved. The orchestrator cancels obsolete tasks before assigning replacements. The whole session is reset only by the orchestrator: its `init` clears an old session when no assistant is active (`--keep` to join it instead), and `reset` does it by hand.
 
 ## Two ways to be an assistant
 
@@ -48,12 +48,34 @@ Everything lives under `.agents-duo/`, with one folder per participant:
 | Type | Sent by | Meaning |
 |---|---|---|
 | `ping` / `pong` | all | Presence. The script answers every ping with a pong automatically. |
-| `task` | orchestrator | A unit of work (template in duo-orchestrator). |
-| `result` | assistant | The finished task, `--reply-to <task id>`. |
+| `task` | orchestrator | One phase with exact inputs, commands, expected outputs and acceptance criteria. |
+| `result` | assigned assistant | Submission for review, `--reply-to <task id>`; keeps the task open. |
 | `question` / `answer` | all | Clarification. The answer uses `--reply-to`. |
-| `status` | all | Progress heartbeat. The orchestrator may add `feedback_interval`. |
-| `done` | orchestrator | Accepts a result. |
+| `status` | all | Informational progress heartbeat, never an execution handoff. The orchestrator may add `feedback_interval`. |
+| `done` | orchestrator | Accepts the latest submitted result and closes that assignee's task. |
+| `revise` | orchestrator | Requests explicit corrections to a submitted result; keeps the original task open. |
+| `cancel` | orchestrator | Closes obsolete or dropped work without acceptance; explain why. |
 | `bye` | all | Orchestrator → all ends the session (`PEER_SAID_BYE`). Assistant → orchestrator means that assistant left (`ASSISTANT_LEFT: <name>`). |
+
+## Task lifecycle and handoffs
+
+`assigned → submitted → accepted`, or `submitted → revision_requested → submitted`. The orchestrator can move any open task to `cancelled`. `status` lists each assignee's state, including accepted and cancelled work. `result`, `answer`, `status`, a new task, and `bye` never close a task. Only the orchestrator sends `done` or `cancel`. Questions close on an `answer`.
+
+Prefer separate preparation and execution tasks: accept the scripts/check design first, then send a fresh task when implementation is ready. That execution task must link the prepared checks, identify the input/revision, supply the exact command and expected output paths, and enumerate the execution acceptance criteria. “Implementation ready” in a status message does not start work. A preparation result verifies only the preparation task.
+
+Review commands (not standalone `done`/`revise` subcommands):
+
+```text
+python agents_bus.py send --role orchestrator --type done --reply-to RESULT_ID --title "accepted" --body "Reviewed evidence ..."
+python agents_bus.py send --role orchestrator --type revise --reply-to RESULT_ID --title "complete checks" --body-file corrections.md
+python agents_bus.py send --role orchestrator --type cancel --to NAME --reply-to TASK_ID --title "cancelled" --body "Reason ..."
+```
+
+`done` and `revise` can also reference a task ID; they target its latest submitted result. For plain-file results (which have no bus message ID), use `--to NAME --reply-to TASK_ID`. The stored section key identifies the reviewed outbox entry. For broadcast tasks, each assignee needs a separate decision; specify `--to NAME` when referencing the task. New assistants do not inherit v3 broadcast tasks. Revisions submit results against the original task ID. A stale result, wrong assignee, acceptance without a result, or assistant-side acceptance is rejected before writing a message.
+
+Every result must include every acceptance criterion verbatim, marked `passed`, `failed`, or `unverified`, plus an evidence link and observed finding or an explanation of the gap. Full-content requirements need full-content evidence, not selected fields or samples. The orchestrator checks coverage and evidence before `done`; the bus validates transitions, not report semantics. One owner generates each artifact, another reviews it. Repeat checks only for a specific gap, stale input, or conflicting finding.
+
+The v3 reader also understands v2 indexes and `done` references. Old results without orchestrator acceptance now appear as submitted/open; review or cancel them explicitly. Upgrade both skill copies together; older scripts still apply the old closure rules.
 
 ## Token usage
 
@@ -61,9 +83,9 @@ Every sent message gets a `usage:` line, measured by the script from the sender'
 
 - **Claude Code:** the newest `~/.claude/projects/<project-slug>/*.jsonl`. Total and cached tokens, current context, model. Parsed incrementally.
 - **Codex:** the newest `~/.codex/sessions/**/rollout-*.jsonl` whose `cwd` is the project. Total tokens, context / window %, and plan limits (percent used, window, reset time) when Codex records them.
-- **Others:** `--usage "<text>"` on `send`/`pulse` (marked `src self-reported`). Plain-file assistants report nothing.
+- **Others:** `--usage "<measurement, source and scope>"` on `send`/`pulse` (marked `src self-reported`). Plain-file assistants include available usage in the report body; it is not extracted into the usage summary.
 
-The platform is detected from `init --agent`. The orchestrator sees `[usage: …]` on each message it receives, and `status` shows each participant's latest usage and active time.
+The platform is detected from `init --agent`. The orchestrator sees `[usage: …]` on each message it receives, and `status` shows each participant's latest usage and active time. Unavailable measurements are explicitly `unavailable`, never zero. Token-savings claims require comparable usage scope and a baseline; missing measurements prevent that conclusion.
 
 Limitation: if two participants run on the same platform in the same project, both may measure the newest log of that platform.
 
@@ -71,8 +93,8 @@ Limitation: if two participants run on the same platform in the same project, bo
 
 - `wait` blocks for at most **60s**, then prints `NO_NEW_MESSAGES`, and the agent calls it again.
 - The orchestrator sets `feedback_interval` (default **30s**) in its ping, and changes it with `send --type status --feedback-interval N` (to all, or `--to <name>`).
-- `pulse --note "..."` returns new messages right away and sends a `status` only when the interval has passed.
-- A bus participant silent for more than 3× the interval triggers a `WARNING` in the other side's `wait`. Plain-file assistants never trigger it.
+- `pulse --note "..."` returns new messages right away and sends a `status` only when the interval has passed. Its `NEXT:` follows task state: continue assigned work, or wait for answers/review when appropriate. No new messages does not mean stop working.
+- A bus participant silent for more than 3× the interval (10× with open tasks) triggers a `WARNING` in the other side's `wait`. Plain-file assistants never trigger it. Open tasks, including submitted results, retain a 30-minute activity grace for reset/start checks.
 
 ## Script commands
 

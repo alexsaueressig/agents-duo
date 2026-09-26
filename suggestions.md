@@ -1,6 +1,8 @@
 # Suggestions
 
-Code review from a duo session on 2026-09-25. The reviewer was assistant `claudinho` (Claude Code). The orchestrator spot-checked it: A1 and A2 were confirmed against the code. Nothing here has been applied yet.
+Code review from a duo session on 2026-09-25. The reviewer was assistant `claudinho` (Claude Code). The orchestrator spot-checked it: A1 and A2 were confirmed against the code.
+
+The subsequent task-lifecycle update addresses A1, A2, B1, B2, B5, and B8, with regression coverage for C2, C3, and C5. The remaining items below are historical review findings, not a statement that every issue has been fixed.
 
 Line numbers refer to `skills/duo-orchestrator/scripts/agents_bus.py` as of commit `5056da2`. The assistant copy is identical.
 

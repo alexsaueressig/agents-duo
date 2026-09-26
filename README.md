@@ -35,7 +35,21 @@ In the same project folder:
 1. **Orchestrator**, e.g. Claude Code: `/duo-orchestrator`, then describe the goal. It starts a fresh session, clearing the previous `.agents-duo/` unless an assistant in it is still active.
 2. **Assistants**, e.g. Codex: `$duo-assistant`. It asks you for the assistant's name. Start as many as you like, each with its own name.
 
-Any of them can start first. Pings are answered automatically. The orchestrator sends tasks to a named assistant (or to all), and assistants send progress updates and then results. The orchestrator ends the session with `bye`, and an assistant leaves with `bye`.
+Any of them can start first. Pings are answered automatically. The orchestrator sends tasks to a named assistant (or to all), and assistants send progress updates and then results. Results stay open for review until the orchestrator sends `done` to accept them, or `cancel` to close obsolete work without acceptance. `revise` requests corrections on the same task. The orchestrator ends the session with `bye`, and an assistant leaves with `bye`; neither accepts unfinished work.
+
+### Handoffs and evidence
+
+Use separate tasks to **prepare checks** and **execute checks**. Once preparation is accepted and implementation is ready, send an execution task with the exact command, working directory, input/revision, expected outputs, and acceptance criteria. Status messages are informational; “implementation ready” does not start a new phase.
+
+Every result reports every acceptance criterion as **passed**, **failed**, or **unverified**, linked to evidence with the observed finding or a reason for the gap. A sample or selected fields cannot pass a complete-content requirement. Assign one owner to generate each artifact and another to review it; rerun checks only to resolve specific gaps or stale/conflicting evidence.
+
+`status` shows `assigned`, `submitted`, `revision_requested`, `accepted`, and `cancelled` per assignee. Accept with the actual CLI command:
+
+```text
+python <path-to>/agents_bus.py send --role orchestrator --type done --reply-to <result-id> --title "accepted" --body "Reviewed criteria and evidence ..."
+```
+
+For a plain-file result, use `--to <name> --reply-to <task-id>`. Broadcast tasks require separate review for each assignee. Both skill copies must use the same bus version; v3 reads older history but keeps results without acceptance open for review.
 
 ### Agents without the skills
 
@@ -67,7 +81,7 @@ The bus script reads each agent's own local session log. This costs no agent tok
 - **Codex:** total tokens, context / window %, plan limit % and reset time (when Codex records them)
 - **Other agents:** optional `--usage "..."` self-report
 
-The orchestrator sees `[usage: …]` on each incoming message. `status` shows each agent's latest usage and active time, so heavy work goes to whoever has headroom.
+The orchestrator sees `[usage: …]` on each incoming message. `status` shows each agent's latest usage and active time, so heavy work goes to whoever has headroom. Missing usage is shown as `unavailable`, never zero; reports include the source/scope or say it is unavailable. Do not claim token savings without comparable measurements and a baseline.
 
 ## How the file concurrency problem is solved
 
@@ -95,7 +109,7 @@ Stress-tested with 6 assistants and 120 concurrent tasks: no messages lost, dupl
 - A blocking `wait` is **capped at 60 s**. On timeout the agent waits again.
 - The orchestrator sets the **feedback interval** (default **30 s**) and can change it for all or for one assistant.
 - While working, agents run `pulse` between steps. It picks up new instructions right away and sends a progress `status` only when due.
-- A bus participant silent for more than 3× the interval triggers a warning. Nobody takes over its work without the user's OK.
+- A bus participant silent for more than 3× the interval (10× with open tasks) triggers a warning. Nobody takes over its work without the user's OK.
 
 ## The bus CLI
 
@@ -114,7 +128,7 @@ Commands: `init`, `send`, `wait`, `check`, `pulse`, `status`, `invite`, `read`, 
 - **Codex shell timeout:** Codex's default shell timeout is shorter than 60 s. The skills tell the agent to use at least 75 s for `wait`.
 - **Git:** if the project has a `.gitignore`, `init` adds `.agents-duo/` to it.
 - **Starting over:** `/duo-orchestrator` clears the old session on start when no assistant is active (`init --keep` joins it instead). `python $BUS reset` wipes it by hand and refuses while an agent still looks active unless you pass `--force`.
-- **Restarting one assistant:** run `$duo-assistant` again under the same name. It resubscribes: only its own part is reset, its unfinished tasks come back to the orchestrator as `dropped`, and the rest of the session keeps going.
+- **Restarting one assistant:** run `$duo-assistant` again under the same name. It resubscribes: only its own part is reset, work in progress comes back as an incomplete `dropped` result for review/cancellation, and previously submitted results remain awaiting review. The rest of the session keeps going.
 - **Same platform twice:** if two agents on the same platform work in the same project, their usage may be measured from the same (newest) session log.
 
 ## Development

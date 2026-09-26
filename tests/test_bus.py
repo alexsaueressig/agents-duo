@@ -25,6 +25,10 @@ def asst(root, name, *args, **kw):
     return bus(root, args[0], "--role", "assistant", "--name", name, *args[1:], **kw)
 
 
+def sent_id(result):
+    return result.stdout.split("[")[1].split("]")[0]
+
+
 class BusTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -76,8 +80,11 @@ class BusTest(unittest.TestCase):
             out = asst(self.root, "codex", "wait", "--timeout", "2").stdout
             self.assertIn(f"[{tid:04d}] TASK", out)
             self.assertIn(f"--type result --reply-to {tid}", out)
-            asst(self.root, "codex", "send", "--type", "result", "--reply-to", str(tid), "--title", "ok", "--body", "d")
+            rid = sent_id(asst(self.root, "codex", "send", "--type", "result", "--reply-to", str(tid), "--title", "ok", "--body", "d"))
             self.assertIn("RESULT from codex", orch(self.root, "wait", "--timeout", "2").stdout)
+            self.assertIn(f"[{tid:04d}] submitted -> codex", bus(self.root, "status").stdout)
+            orch(self.root, "send", "--type", "done", "--reply-to", rid, "--title", "accepted")
+            asst(self.root, "codex", "check")
         self.assertFalse([p for p in (self.root / ".agents-duo/messages").iterdir() if p.suffix == ".tmp"])
         self.assertIn("open tasks/questions: none", bus(self.root, "status").stdout)
         self.assertIn("NO_NEW_MESSAGES", asst(self.root, "codex", "check").stdout)
@@ -143,7 +150,9 @@ class BusTest(unittest.TestCase):
         self.assertNotIn("RESULT", orch(self.root, "check").stdout)  # not delivered twice
         status = bus(self.root, "status").stdout
         self.assertIn("copilot (assistant, plain files)", status)
-        self.assertIn("open tasks/questions: none", status)
+        self.assertIn(f"[{tid}] submitted -> copilot", status)
+        orch(self.root, "send", "--to", "copilot", "--type", "done", "--reply-to", tid, "--title", "accepted")
+        self.assertIn("open tasks/questions: none", bus(self.root, "status").stdout)
         orch(self.root, "send", "--type", "bye", "--title", "end", "--body", "thanks")
         self.assertIn("Session ended", (self.root / ".agents-duo/copilot/inbox.md").read_text(encoding="utf-8"))
 
@@ -229,8 +238,12 @@ class BusTest(unittest.TestCase):
         self.assertIn(f"RESULT from a (re:{open_id}): dropped: assistant resubscribed", out)
         self.assertIn("Fresh start: resubscribed", out)
         status = bus(self.root, "status").stdout
-        self.assertIn("open tasks/questions: none", status)
+        self.assertIn(f"[{done_id}] submitted -> a", status)  # a previous result still needs review
+        self.assertIn(f"[{open_id}] submitted -> a", status)  # dropped work does not vanish
         self.assertIn("sent 5", status)  # history kept: ping, pong, result, dropped result, new ping
+        orch(self.root, "send", "--type", "done", "--reply-to", done_id, "--title", "accepted")
+        orch(self.root, "send", "--type", "cancel", "--reply-to", open_id, "--title", "reassign dropped work")
+        self.assertIn("open tasks/questions: none", bus(self.root, "status").stdout)
         orch(self.root, "send", "--type", "task", "--title", "after", "--body", "x")
         self.assertIn("TASK from orchestrator: after", asst(self.root, "a", "check").stdout)
 
@@ -316,6 +329,145 @@ class BusTest(unittest.TestCase):
         self.assertLess(time.time() - start, 5)
         self.assertIn("NO_NEW_MESSAGES", out)
         self.assertIn("NEXT: run the same wait again", out)
+
+    def test_revision_then_acceptance_and_invalid_transitions(self):
+        orch(self.root, "init")
+        for name in ("a", "b"):
+            asst(self.root, name, "init")
+        tid = sent_id(orch(self.root, "send", "--type", "task", "--to", "a", "--title", "complete entries"))
+        messages = self.root / ".agents-duo/messages"
+        count = len(list(messages.iterdir()))
+        for sender, name, kind, reference in (
+            (asst, "a", "done", tid), (asst, "a", "revise", tid), (asst, "a", "cancel", tid),
+            (asst, "b", "result", tid), (asst, "a", "result", "9999"),
+        ):
+            r = sender(self.root, name, "send", "--type", kind, "--reply-to", reference, "--title", "invalid", check=False)
+            self.assertNotEqual(r.returncode, 0, (kind, r.stdout))
+        r = orch(self.root, "send", "--type", "done", "--reply-to", tid, "--title", "too early", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(len(list(messages.iterdir())), count)
+
+        rid = sent_id(asst(self.root, "a", "send", "--type", "result", "--reply-to", tid, "--title", "titles only"))
+        orch(self.root, "send", "--type", "revise", "--reply-to", rid, "--title", "compare full entries")
+        self.assertIn(f"[{tid}] revision_requested -> a", bus(self.root, "status").stdout)
+        self.assertIn(f"NEXT: do task {tid}", asst(self.root, "a", "check").stdout)
+        r = orch(self.root, "send", "--type", "done", "--reply-to", rid, "--title", "still incomplete", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        latest = sent_id(asst(self.root, "a", "send", "--type", "result", "--reply-to", tid, "--title", "complete evidence"))
+        self.assertIn(f"[{tid}] submitted -> a", bus(self.root, "status").stdout)
+        r = orch(self.root, "send", "--type", "done", "--reply-to", rid, "--title", "stale", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        orch(self.root, "send", "--type", "done", "--reply-to", latest, "--title", "accepted")
+        status = bus(self.root, "status").stdout
+        self.assertIn(f"[{tid}] accepted -> a", status)
+        self.assertIn("open tasks/questions: none", status)
+        self.assertNotEqual(asst(self.root, "a", "send", "--type", "result", "--reply-to", tid,
+                                 "--title", "late", check=False).returncode, 0)
+
+    def test_status_is_not_handoff_and_pulse_keeps_task_active(self):
+        orch(self.root, "init", "--feedback-interval", "1")
+        asst(self.root, "a", "init")
+        tid = sent_id(orch(self.root, "send", "--type", "task", "--title", "prepare checks"))
+        asst(self.root, "a", "check")
+        time.sleep(1.1)
+        out = asst(self.root, "a", "pulse", "--reply-to", tid, "--note", "preparing").stdout
+        self.assertIn("STATUS_SENT", out)
+        self.assertIn(f"NEXT: continue task {tid}", out)
+        self.assertNotIn("wait again", out)
+        rid = sent_id(asst(self.root, "a", "send", "--type", "result", "--reply-to", tid, "--title", "prepared"))
+        orch(self.root, "send", "--type", "status", "--title", "implementation ready", "--reply-to", tid)
+        out = asst(self.root, "a", "check").stdout
+        self.assertIn("await orchestrator review", out)
+        self.assertNotIn("NEXT: do task", out)
+        self.assertIn(f"[{tid}] submitted -> a", bus(self.root, "status").stdout)
+        orch(self.root, "send", "--type", "done", "--reply-to", rid, "--title", "accepted preparation")
+        execute = sent_id(orch(self.root, "send", "--type", "task", "--title", "execute checks",
+                               "--body", "Run python checks.py; expected evidence.json with all criteria."))
+        self.assertIn(f"NEXT: do task {execute}", asst(self.root, "a", "check").stdout)
+
+    def test_question_pauses_only_its_task_until_answer(self):
+        orch(self.root, "init")
+        asst(self.root, "a", "init")
+        tid = sent_id(orch(self.root, "send", "--type", "task", "--title", "verify"))
+        asst(self.root, "a", "check")
+        qid = sent_id(asst(self.root, "a", "send", "--type", "question", "--reply-to", tid, "--title", "which input?"))
+        out = asst(self.root, "a", "pulse").stdout
+        self.assertIn("or an answer", out)
+        self.assertNotIn("NEXT: continue task", out)
+        orch(self.root, "send", "--type", "answer", "--reply-to", qid, "--title", "input.json")
+        self.assertIn(f"NEXT: continue task {tid}", asst(self.root, "a", "check").stdout)
+        self.assertIn(f"[{tid}] assigned -> a", bus(self.root, "status").stdout)
+
+    def test_broadcast_results_require_individual_acceptance(self):
+        orch(self.root, "init")
+        for name in ("a", "b"):
+            asst(self.root, name, "init")
+        tid = sent_id(orch(self.root, "send", "--type", "task", "--to", "all", "--title", "review"))
+        rid = sent_id(asst(self.root, "a", "send", "--type", "result", "--reply-to", tid, "--title", "reviewed"))
+        orch(self.root, "send", "--type", "done", "--reply-to", rid, "--title", "accepted a")
+        status = bus(self.root, "status").stdout
+        self.assertIn(f"[{tid}] accepted -> a", status)
+        self.assertIn(f"[{tid}] assigned -> b", status)
+        self.assertNotIn("open tasks/questions: none", status)
+        asst(self.root, "c", "init")
+        self.assertNotIn(f"[{tid}] assigned -> c", bus(self.root, "status").stdout)
+        self.assertNotIn("NEXT: do task", asst(self.root, "c", "check").stdout)
+        orch(self.root, "send", "--type", "cancel", "--to", "b", "--reply-to", tid, "--title", "review no longer needed")
+        self.assertIn("open tasks/questions: none", bus(self.root, "status").stdout)
+
+    def test_plain_file_revision_and_acceptance_survive_appends(self):
+        import os
+        orch(self.root, "init")
+        bus(self.root, "invite", "copilot")
+        tid = sent_id(orch(self.root, "send", "--type", "task", "--title", "verify full entries"))
+        outbox = self.root / ".agents-duo/copilot/outbox.md"
+
+        def append_result(text):
+            with outbox.open("a", encoding="utf-8") as f:
+                f.write(text)
+            old = time.time() - 5
+            os.utime(outbox, (old, old))
+
+        append_result(f"## reply {tid}\nTitles checked\n")
+        orch(self.root, "send", "--type", "revise", "--to", "copilot", "--reply-to", tid, "--title", "full entries required")
+        self.assertIn(f"[{tid}] revision_requested -> copilot", bus(self.root, "status").stdout)
+        append_result(f"## reply {tid}\nComplete entries checked\n")
+        self.assertIn(f"[{tid}] submitted -> copilot", bus(self.root, "status").stdout)
+        orch(self.root, "send", "--type", "done", "--to", "copilot", "--reply-to", tid, "--title", "accepted")
+        # Even while a new section is being edited, an existing acceptance remains final.
+        with outbox.open("a", encoding="utf-8") as f:
+            f.write("## status\nWaiting\n")
+        self.assertIn(f"[{tid}] accepted -> copilot", bus(self.root, "status").stdout)
+        append_result("## bye\nLeaving\n")
+        self.assertIn("open tasks/questions: none", bus(self.root, "status").stdout)
+        append_result(f"## reply {tid}\nUnrequested extra result\n")
+        status = bus(self.root, "status").stdout
+        self.assertIn(f"[{tid}] accepted -> copilot: verify full entries | result=plain-copilot-2", status)
+
+    def test_invalid_resubscribe_options_do_not_mutate_tasks(self):
+        orch(self.root, "init")
+        asst(self.root, "a", "init")
+        tid = sent_id(orch(self.root, "send", "--type", "task", "--title", "active"))
+        chat = self.root / ".agents-duo"
+        before = {str(p.relative_to(chat)): p.read_bytes() for p in chat.rglob("*") if p.is_file()}
+        for args in (("--feedback-interval", "1"), ("--keep",)):
+            self.assertNotEqual(asst(self.root, "a", "init", "--takeover", *args, check=False).returncode, 0)
+        after = {str(p.relative_to(chat)): p.read_bytes() for p in chat.rglob("*") if p.is_file()}
+        self.assertEqual(before, after)
+        self.assertIn(f"[{tid}] assigned -> a", bus(self.root, "status").stdout)
+
+    def test_bye_does_not_accept_and_unknown_usage_is_explicit(self):
+        orch(self.root, "init")
+        asst(self.root, "a", "init", "--agent", "Copilot")
+        tid = sent_id(orch(self.root, "send", "--type", "task", "--title", "verify"))
+        asst(self.root, "a", "send", "--type", "result", "--reply-to", tid, "--title", "submitted")
+        self.assertIn("[usage: unavailable]", orch(self.root, "check").stdout)
+        orch(self.root, "send", "--type", "bye", "--title", "end")
+        out = asst(self.root, "a", "check").stdout
+        self.assertIn("PEER_SAID_BYE", out)
+        self.assertNotIn("NEXT: continue task", out)
+        self.assertNotIn("wait again", out)
+        self.assertIn(f"[{tid}] submitted -> a", bus(self.root, "status").stdout)
 
 
 if __name__ == "__main__":
